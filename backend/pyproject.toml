@@ -1,0 +1,26 @@
+[project]
+name = "photocad"
+version = "0.1.0"
+description = "Multi-Axis Vision to Parametric B-Rep CAD Platform"
+authors = [{ name = "PhotoCAD Developer" }]
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "pydantic>=2.8.0",
+    "pydantic-settings>=2.4.0",
+    "sqlalchemy>=2.0.30",
+    "aiosqlite>=0.20.0",
+    "python-multipart>=0.0.9",
+    "websockets>=12.0",
+    "opencv-python-headless>=4.10.0.84",
+    "numpy>=1.26.0",
+    "pillow>=10.4.0",
+    "google-genai>=0.1.1",
+    "aiofiles>=24.1.0"
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

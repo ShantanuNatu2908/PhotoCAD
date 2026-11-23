@@ -1,0 +1,47 @@
+@import "tailwindcss";
+
+@theme {
+  --color-cad-dark: #0f141c;
+  --color-cad-card: #161d28;
+  --color-cad-border: #242f40;
+  --color-cad-accent: #00f0ff;
+  --color-cad-neon: #39ff14;
+  --color-cad-warning: #ffb703;
+  --color-cad-danger: #ff0055;
+}
+
+:root {
+  color-scheme: dark;
+}
+
+body {
+  margin: 0;
+  background-color: #0b0f17;
+  color: #e2e8f0;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  overflow-x: hidden;
+}
+
+/* Engineering Blueprint Grid Background */
+.cad-grid-bg {
+  background-image: 
+    linear-gradient(to right, rgba(255, 255, 255, 0.03) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255, 255, 255, 0.03) 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+
+/* Custom Scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #0f141c;
+}
+::-webkit-scrollbar-thumb {
+  background: #242f40;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #00f0ff;
+}
