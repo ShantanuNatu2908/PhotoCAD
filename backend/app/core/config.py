@@ -1,8 +1,10 @@
 import os
 from pathlib import Path
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
     PROJECT_NAME: str = "PhotoCAD"
     VERSION: str = "0.1.0"
     API_V1_PREFIX: str = "/api"
@@ -15,15 +17,11 @@ class Settings(BaseSettings):
     EXPORTS_DIR: Path = STORAGE_DIR / "cad_exports"
     
     # Database
-    DATABASE_URL: str = f"sqlite+aiosqlite:///{STORAGE_DIR / 'photocad.db'}"
+    DATABASE_URL: str = f"sqlite+aiosqlite:///{STORAGE_DIR.as_posix()}/photocad.db"
     
     # LLM Settings
     GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
     DEFAULT_LLM_MODEL: str = "gemini-2.0-flash"
-    
-    class Config:
-        env_file = ".env"
-        extra = "ignore"
 
 settings = Settings()
 

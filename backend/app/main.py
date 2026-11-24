@@ -7,6 +7,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.core.config import settings
 from app.core.database import init_db
+from app.core.cloud_config import CloudHealthService
 from app.api.routes_projects import router as projects_router
 from app.api.routes_scans import router as scans_router
 from app.api.routes_generate import router as generate_router
@@ -87,3 +88,9 @@ async def health_check():
         "service": settings.PROJECT_NAME,
         "version": settings.VERSION
     }
+
+@app.get("/health/cloud")
+@app.get(f"{settings.API_V1_PREFIX}/health/cloud")
+async def cloud_health_diagnostics():
+    """Returns connection diagnostics across the 4 managed cloud tiers."""
+    return await CloudHealthService.get_full_diagnostics()
