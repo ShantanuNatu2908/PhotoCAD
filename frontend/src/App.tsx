@@ -14,13 +14,16 @@ import type {
   CalibrationSpec,
   Open3DGeometryReport,
   ScanWsEvent,
+  ValidationMetrics,
 } from './types/cad';
 import {
   API_BASE,
   uploadAndRunCvFusion,
   resolveBackendAssetUrl,
+  subscribeScanEvents,
+  refineCadRevision,
 } from './services/scanApi';
-import { Play, Download, Sparkles, RefreshCw, Camera, Grid, Layers, CheckCircle2 } from 'lucide-react';
+import { Play, Download, Sparkles, RefreshCw, Camera, Grid, Layers, CheckCircle2, Wand2 } from 'lucide-react';
 
 async function generateDemoPngBatch(): Promise<Record<AxisView, KeyframeCapture>> {
   const specs: Record<AxisView, [number, number]> = {
@@ -89,6 +92,10 @@ export const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<'camera' | 'grid'>('camera');
   const [generation, setGeneration] = useState<CadGeneration | null>(null);
   const [agentLogs, setAgentLogs] = useState<AgentLog[]>([]);
+  const [activeLangGraphNode, setActiveLangGraphNode] = useState<string | null>(null);
+  const [validationMetrics, setValidationMetrics] = useState<ValidationMetrics | null>(null);
+  const [refinePrompt, setRefinePrompt] = useState('');
+  const [isRefining, setIsRefining] = useState(false);
   const [isGenerating, setIsGenerating] = useState(false);
   const [showExportModal, setShowExportModal] = useState(false);
 
@@ -303,31 +310,129 @@ export const App: React.FC = () => {
     }
   };
 
-  // Trigger Multi-Agent CAD Synthesis
+  // Handle live LangGraph WebSocket events streamed from /ws/v1/scans/{scanId}
+  const handleScanWsEvent = (ev: ScanWsEvent) => {
+    const p = ev.payload || {};
+    if (ev.event === 'agent_node_started') {
+      const node = String(p.node || '');
+      setActiveLangGraphNode(node);
+      const nameMap: Record<string, string> = {
+        geometry_analyst: 'VisionAnalyst',
+        parametric_architect: 'CSGArchitect',
+        cad_synthesizer: 'CadCoder',
+        sandbox_executor: 'SandboxExecutor',
+        geometric_validator: 'Validator',
+      };
+      appendLog(nameMap[node] || 'Orchestrator', 'thought', String(p.message || `Running ${node}...`));
+    } else if (ev.event === 'cad_code_diff') {
+      appendLog('CadCoder', 'diff', String(p.diff || p.code || ''));
+    } else if (ev.event === 'cad_compile_error') {
+      appendLog('SandboxExecutor', 'error', `[Retry ${p.attempt}/${p.max_attempts}] ${String(p.error_summary || '')}`);
+    } else if (ev.event === 'validation_completed') {
+      const m = p as unknown as ValidationMetrics;
+      setValidationMetrics({
+        is_watertight: Boolean(m.is_watertight),
+        volume_mm3: Number(m.volume_mm3 || 0),
+        surface_area_mm2: Number(m.surface_area_mm2 || 0),
+        chamfer_mean_mm: Number(m.chamfer_mean_mm || 0),
+        chamfer_p95_mm: Number(m.chamfer_p95_mm || 0),
+        bbox_delta_mm: (m.bbox_delta_mm as [number, number, number]) || [0, 0, 0],
+        passed_tolerance: Boolean((p as Record<string, unknown>).passed),
+        discrepancy_notes: (m.discrepancy_notes as string[]) || [],
+      });
+      appendLog(
+        'Validator',
+        (p as Record<string, unknown>).passed ? 'success' : 'info',
+        `Chamfer ${Number(p.chamfer_mean_mm || 0).toFixed(3)} mm (P95 ${Number(p.chamfer_p95_mm || 0).toFixed(3)} mm) • Watertight=${String(p.is_watertight)}`
+      );
+    } else if (ev.event === 'pipeline_completed') {
+      setActiveLangGraphNode(null);
+      setSystemStatus('Verified .STEP Ready');
+    }
+  };
+
+  // Trigger Multi-Agent LangGraph CAD Synthesis
   const handleSynthesizeCAD = async () => {
     setIsGenerating(true);
+    setSystemStatus('LangGraph Dual-Loop...');
 
-    if (!scanSessionId) {
-      handleLoadDemo();
-    }
+    let targetScanId = scanSessionId;
+    let unsubscribeWs = () => {};
 
     try {
+      if (!targetScanId || targetScanId.startsWith('demo-')) {
+        const batch = capturedKeyframes || (await generateDemoPngBatch());
+        const calib: CalibrationSpec = calibrationSpec || {
+          mode: 'known_dimension',
+          reference_side: 'front',
+          known_length_mm: 80.0,
+          point_a_px: [58, 100],
+          point_b_px: [262, 100],
+          mm_per_unit: 80.0 / 204.0,
+        };
+        const fused = await uploadAndRunCvFusion(projectId, batch, calib, handleScanWsEvent);
+        targetScanId = fused.scan_id;
+        setScanSessionId(targetScanId);
+        setGeometryReport(fused.geometry_report);
+        setPlyUrl(resolveBackendAssetUrl(fused.ply_url));
+      }
+
+      unsubscribeWs = subscribeScanEvents(targetScanId, handleScanWsEvent);
+
       const res = await fetch(`${API_BASE}/generate/trigger`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          scan_session_id: scanSessionId || 'demo-session-882',
-          target_engine: 'cadquery',
+          scan_session_id: targetScanId,
+          target_engine: 'build123d',
         }),
       });
 
       if (res.ok) {
         const gen: CadGeneration = await res.json();
         setGeneration(gen);
+      } else {
+        throw new Error(`HTTP ${res.status}`);
       }
     } catch (e) {
       console.warn('Fallback local agent simulation loop active', e);
       simulateAgentLoop();
+    } finally {
+      setTimeout(unsubscribeWs, 12000);
+    }
+  };
+
+  // Phase 4 Checkpointed Conversational /refine Edit
+  const handleRefineCAD = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!scanSessionId || scanSessionId.startsWith('demo-') || !refinePrompt.trim()) return;
+    setIsRefining(true);
+    setSystemStatus('Refining Checkpoint...');
+    const unsub = subscribeScanEvents(scanSessionId, handleScanWsEvent);
+    appendLog('CSGArchitect', 'thought', `Resuming LangGraph checkpoint for edit: "${refinePrompt}"`);
+
+    try {
+      const updated = await refineCadRevision(scanSessionId, refinePrompt.trim(), generation?.version || 1);
+      setGeneration({
+        id: updated.generation_id,
+        scan_session_id: updated.scan_id,
+        version: updated.revision,
+        status: updated.status as CadGeneration['status'],
+        code: updated.code,
+        step_file: updated.artifacts.step_url,
+        stl_file: updated.artifacts.stl_url,
+        dxf_file: updated.artifacts.dxf_url,
+        dimensions_mm: updated.dimensions_mm,
+        created_at: new Date().toISOString(),
+      });
+      setRefinePrompt('');
+      setSystemStatus(`Rev v${updated.revision} Ready`);
+    } catch (err) {
+      appendLog('Orchestrator', 'error', err instanceof Error ? err.message : 'Refine failed');
+    } finally {
+      setIsRefining(false);
+      setActiveLangGraphNode(null);
+      setTimeout(unsub, 500);
     }
   };
 
@@ -549,9 +654,34 @@ export const App: React.FC = () => {
             <div className="h-[280px] w-full">
               <AgentTerminal
                 logs={agentLogs}
-                status={generation?.status || (isFusing ? 'generating' : isGenerating ? 'generating' : 'idle')}
+                status={generation?.status || (isFusing || isGenerating || isRefining ? 'generating' : 'idle')}
+                activeNode={activeLangGraphNode}
+                validationMetrics={validationMetrics}
               />
             </div>
+
+            {generation?.status === 'completed' && scanSessionId && !scanSessionId.startsWith('demo-') && (
+              <form
+                onSubmit={handleRefineCAD}
+                className="flex items-center gap-2 bg-cad-card border border-cyan-800/60 p-2.5 rounded-xl shadow-md"
+              >
+                <Wand2 className="w-4 h-4 text-cyan-400 shrink-0 ml-1" />
+                <input
+                  type="text"
+                  value={refinePrompt}
+                  onChange={(e) => setRefinePrompt(e.target.value)}
+                  placeholder='Parametric /refine edit (e.g. "Change center hole diameter to 12 mm")'
+                  className="flex-1 bg-transparent text-xs font-mono text-white placeholder-slate-500 focus:outline-none"
+                />
+                <button
+                  type="submit"
+                  disabled={isRefining || !refinePrompt.trim()}
+                  className="px-3.5 py-1.5 rounded-lg bg-cyan-600 hover:bg-cyan-500 disabled:opacity-40 text-white font-mono text-xs font-semibold transition"
+                >
+                  {isRefining ? 'Refining...' : 'Apply /refine'}
+                </button>
+              </form>
+            )}
           </div>
         </div>
       </main>

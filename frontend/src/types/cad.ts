@@ -101,10 +101,21 @@ export interface ScanSession {
   created_at: string;
 }
 
+export interface ValidationMetrics {
+  is_watertight: boolean;
+  volume_mm3: number;
+  surface_area_mm2: number;
+  chamfer_mean_mm: number;
+  chamfer_p95_mm: number;
+  bbox_delta_mm: [number, number, number];
+  passed_tolerance: boolean;
+  discrepancy_notes: string[];
+}
+
 export interface AgentLog {
   id: string;
   agent_name: string;
-  log_type: 'info' | 'thought' | 'code' | 'error' | 'success';
+  log_type: 'info' | 'thought' | 'code' | 'diff' | 'error' | 'success';
   message: string;
   created_at: string;
 }

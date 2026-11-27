@@ -180,3 +180,44 @@ export function resolveBackendAssetUrl(pathOrUrl?: string): string | undefined {
   }
   return `${BACKEND_ORIGIN}${pathOrUrl.startsWith('/') ? '' : '/'}${pathOrUrl}`;
 }
+
+export interface ScanGenerateApiResponse {
+  scan_id: string;
+  generation_id: string;
+  revision: number;
+  status: string;
+  dimensions_mm?: { x: number; y: number; z: number };
+  code: string;
+  artifacts: {
+    step_url?: string;
+    stl_url?: string;
+    dxf_url?: string;
+    py_url?: string;
+  };
+}
+
+export async function generateCadForScan(scanId: string): Promise<ScanGenerateApiResponse> {
+  const res = await fetch(`${API_BASE}/scans/${scanId}/generate`, {
+    method: 'POST',
+  });
+  if (!res.ok) {
+    throw new Error(await parseErrorMessage(res, 'LangGraph CAD generation failed'));
+  }
+  return res.json();
+}
+
+export async function refineCadRevision(
+  scanId: string,
+  instruction: string,
+  baseRevision = 1
+): Promise<ScanGenerateApiResponse> {
+  const res = await fetch(`${API_BASE}/scans/${scanId}/refine`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ base_revision: baseRevision, instruction }),
+  });
+  if (!res.ok) {
+    throw new Error(await parseErrorMessage(res, 'Parametric refinement failed'));
+  }
+  return res.json();
+}
