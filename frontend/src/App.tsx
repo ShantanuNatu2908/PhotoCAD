@@ -1,11 +1,12 @@
 import React, { useState, useEffect } from 'react';
 import { Navbar } from './components/Navbar';
 import { SixAxisCapture } from './components/SixAxisCapture';
+import { ScannerChamber } from './components/scanner/ScannerChamber';
 import { CadViewport3D } from './components/CadViewport3D';
 import { AgentTerminal } from './components/AgentTerminal';
 import { ExportModal } from './components/ExportModal';
-import type { AxisView, ViewDetail, CadGeneration, AgentLog } from './types/cad';
-import { Play, Download, Sparkles, RefreshCw } from 'lucide-react';
+import type { AxisView, ViewDetail, CadGeneration, AgentLog, KeyframeCapture, CalibrationSpec } from './types/cad';
+import { Play, Download, Sparkles, RefreshCw, Camera, Grid } from 'lucide-react';
 
 const API_BASE = 'http://localhost:8000/api';
 
@@ -17,6 +18,7 @@ export const App: React.FC = () => {
   const [hasScaleRef, setHasScaleRef] = useState(true);
   const [scalePxToMm, setScalePxToMm] = useState(1.0);
   const [viewsData, setViewsData] = useState<Partial<Record<AxisView, ViewDetail>>>({});
+  const [activeTab, setActiveTab] = useState<'camera' | 'grid'>('camera');
   const [generation, setGeneration] = useState<CadGeneration | null>(null);
   const [agentLogs, setAgentLogs] = useState<AgentLog[]>([]);
   const [isGenerating, setIsGenerating] = useState(false);
@@ -185,6 +187,30 @@ export const App: React.FC = () => {
     }
   };
 
+  const handleKeyframesCaptured = (
+    captures: Record<AxisView, KeyframeCapture>,
+    calibration?: CalibrationSpec
+  ) => {
+    const newViewsData: Partial<Record<AxisView, ViewDetail>> = {};
+    (Object.keys(captures) as AxisView[]).forEach((side) => {
+      const cap = captures[side];
+      newViewsData[side] = {
+        view: side,
+        image_url: cap.dataUrl,
+        edge_url: cap.dataUrl,
+        original_resolution: [cap.width, cap.height],
+        features_detected: 4,
+        primary_dimensions_mm: [80.0, 50.0],
+        features: []
+      };
+    });
+    setViewsData(newViewsData);
+
+    if (calibration?.mm_per_unit) {
+      setScalePxToMm(1.0 / calibration.mm_per_unit);
+    }
+  };
+
   // Trigger Multi-Agent CAD Synthesis
   const handleSynthesizeCAD = async () => {
     setIsGenerating(true);
@@ -332,14 +358,47 @@ export const App: React.FC = () => {
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
           {/* Left Column: 6-Axis Scanning Chamber (5 cols) */}
           <div className="lg:col-span-5 space-y-4">
-            <SixAxisCapture
-              viewsData={viewsData}
-              onUploadView={handleUploadView}
-              onLoadDemo={handleLoadDemo}
-              hasScaleRef={hasScaleRef}
-              setHasScaleRef={setHasScaleRef}
-              scalePxToMm={scalePxToMm}
-            />
+            {/* Capture Mode Tabs */}
+            <div className="flex bg-cad-card border border-cad-border rounded-lg p-1 text-xs font-mono">
+              <button
+                onClick={() => setActiveTab('camera')}
+                className={`flex-1 py-1.5 rounded transition flex items-center justify-center space-x-1.5 ${
+                  activeTab === 'camera'
+                    ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 font-semibold'
+                    : 'text-slate-400 hover:text-white'
+                }`}
+              >
+                <Camera className="w-3.5 h-3.5" />
+                <span>Live Camera (Laplacian Blur Filter)</span>
+              </button>
+              <button
+                onClick={() => setActiveTab('grid')}
+                className={`flex-1 py-1.5 rounded transition flex items-center justify-center space-x-1.5 ${
+                  activeTab === 'grid'
+                    ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 font-semibold'
+                    : 'text-slate-400 hover:text-white'
+                }`}
+              >
+                <Grid className="w-3.5 h-3.5" />
+                <span>6-View Edge Grid</span>
+              </button>
+            </div>
+
+            {activeTab === 'camera' ? (
+              <ScannerChamber
+                onAllKeyframesCaptured={handleKeyframesCaptured}
+                onLoadDemo={handleLoadDemo}
+              />
+            ) : (
+              <SixAxisCapture
+                viewsData={viewsData}
+                onUploadView={handleUploadView}
+                onLoadDemo={handleLoadDemo}
+                hasScaleRef={hasScaleRef}
+                setHasScaleRef={setHasScaleRef}
+                scalePxToMm={scalePxToMm}
+              />
+            )}
 
             {/* Quick Helper Tips */}
             <div className="p-3 bg-cad-card/60 border border-cad-border/70 rounded-xl text-xs space-y-1.5 text-slate-400 font-mono">
