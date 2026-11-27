@@ -1,13 +1,28 @@
 import React, { useEffect, useRef } from 'react';
-import { Terminal, CheckCircle2, AlertTriangle, Cpu, Code2, Sparkles } from 'lucide-react';
-import type { AgentLog } from '../types/cad';
+import { Terminal, CheckCircle2, AlertTriangle, Cpu, Code2, Sparkles, GitCompare } from 'lucide-react';
+import type { AgentLog, ValidationMetrics } from '../types/cad';
 
 interface AgentTerminalProps {
   logs: AgentLog[];
   status: string;
+  activeNode?: string | null;
+  validationMetrics?: ValidationMetrics | null;
 }
 
-export const AgentTerminal: React.FC<AgentTerminalProps> = ({ logs, status }) => {
+const LANGGRAPH_NODES = [
+  { id: 'geometry_analyst', label: '1. Analyst' },
+  { id: 'parametric_architect', label: '2. Architect' },
+  { id: 'cad_synthesizer', label: '3. Synthesizer' },
+  { id: 'sandbox_executor', label: '4. Sandbox' },
+  { id: 'geometric_validator', label: '5. Validator' },
+];
+
+export const AgentTerminal: React.FC<AgentTerminalProps> = ({
+  logs,
+  status,
+  activeNode,
+  validationMetrics,
+}) => {
   const terminalEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -17,13 +32,15 @@ export const AgentTerminal: React.FC<AgentTerminalProps> = ({ logs, status }) =>
   const getAgentBadge = (agent: string) => {
     switch (agent) {
       case 'VisionAnalyst':
-        return <span className="text-[10px] uppercase font-mono px-1.5 py-0.5 rounded bg-blue-900/60 text-blue-300 border border-blue-700">Vision Analyst</span>;
+        return <span className="text-[10px] uppercase font-mono px-1.5 py-0.5 rounded bg-blue-900/60 text-blue-300 border border-blue-700">1. Geometry Analyst</span>;
       case 'CSGArchitect':
-        return <span className="text-[10px] uppercase font-mono px-1.5 py-0.5 rounded bg-purple-900/60 text-purple-300 border border-purple-700">CSG Architect</span>;
+        return <span className="text-[10px] uppercase font-mono px-1.5 py-0.5 rounded bg-purple-900/60 text-purple-300 border border-purple-700">2. Parametric Architect</span>;
       case 'CadCoder':
-        return <span className="text-[10px] uppercase font-mono px-1.5 py-0.5 rounded bg-amber-900/60 text-amber-300 border border-amber-700">Cad Coder</span>;
+        return <span className="text-[10px] uppercase font-mono px-1.5 py-0.5 rounded bg-amber-900/60 text-amber-300 border border-amber-700">3. build123d Synthesizer</span>;
+      case 'SandboxExecutor':
+        return <span className="text-[10px] uppercase font-mono px-1.5 py-0.5 rounded bg-indigo-900/60 text-indigo-300 border border-indigo-700">4. Sandbox Executor</span>;
       case 'Validator':
-        return <span className="text-[10px] uppercase font-mono px-1.5 py-0.5 rounded bg-emerald-900/60 text-emerald-300 border border-emerald-700">Self-Healing Validator</span>;
+        return <span className="text-[10px] uppercase font-mono px-1.5 py-0.5 rounded bg-emerald-900/60 text-emerald-300 border border-emerald-700">5. Chamfer Validator</span>;
       default:
         return <span className="text-[10px] uppercase font-mono px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 border border-slate-700">{agent}</span>;
     }
@@ -35,6 +52,8 @@ export const AgentTerminal: React.FC<AgentTerminalProps> = ({ logs, status }) =>
         return <Sparkles className="w-3.5 h-3.5 text-cyan-400 mt-0.5 shrink-0" />;
       case 'code':
         return <Code2 className="w-3.5 h-3.5 text-amber-400 mt-0.5 shrink-0" />;
+      case 'diff':
+        return <GitCompare className="w-3.5 h-3.5 text-cyan-300 mt-0.5 shrink-0" />;
       case 'error':
         return <AlertTriangle className="w-3.5 h-3.5 text-rose-400 mt-0.5 shrink-0" />;
       case 'success':
@@ -44,20 +63,77 @@ export const AgentTerminal: React.FC<AgentTerminalProps> = ({ logs, status }) =>
     }
   };
 
+  const renderDiffBlock = (diffText: string) => {
+    const lines = diffText.split('\n');
+    return (
+      <pre className="p-2 rounded bg-black/75 border border-slate-800 text-[11px] w-full overflow-x-auto font-mono leading-snug">
+        {lines.map((line, i) => {
+          const cls = line.startsWith('+')
+            ? 'text-emerald-300'
+            : line.startsWith('-')
+            ? 'text-rose-300'
+            : line.startsWith('@@')
+            ? 'text-cyan-400'
+            : 'text-slate-400';
+          return (
+            <div key={i} className={cls}>
+              {line}
+            </div>
+          );
+        })}
+      </pre>
+    );
+  };
+
   return (
     <div className="flex flex-col h-full bg-cad-card border border-cad-border rounded-xl overflow-hidden shadow-xl">
       {/* Header */}
-      <div className="bg-cad-dark px-4 py-2.5 border-b border-cad-border flex items-center justify-between">
+      <div className="bg-cad-dark px-4 py-2 border-b border-cad-border flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center space-x-2">
           <Terminal className="w-4 h-4 text-cyan-400" />
           <span className="text-xs font-mono font-semibold tracking-wide text-slate-200">
-            Multi-Agent Reasoning Stream
+            LangGraph Dual-Loop Stream
           </span>
         </div>
-        <div className="flex items-center space-x-2">
-          <span className={`w-2 h-2 rounded-full ${status === 'completed' ? 'bg-emerald-400' : status === 'generating' || status === 'compiling' ? 'bg-cyan-400 animate-ping' : 'bg-slate-500'}`} />
-          <span className="text-[11px] font-mono uppercase text-slate-400">{status}</span>
+
+        <div className="flex items-center space-x-3">
+          {validationMetrics && (
+            <span
+              className={`text-[10px] font-mono px-2 py-0.5 rounded border ${
+                validationMetrics.passed_tolerance
+                  ? 'bg-emerald-950/70 text-emerald-300 border-emerald-700'
+                  : 'bg-amber-950/70 text-amber-300 border-amber-700'
+              }`}
+            >
+              Chamfer {validationMetrics.chamfer_mean_mm.toFixed(2)}mm • {validationMetrics.is_watertight ? 'Watertight' : 'Open'}
+            </span>
+          )}
+          <div className="flex items-center space-x-2">
+            <span className={`w-2 h-2 rounded-full ${status === 'completed' ? 'bg-emerald-400' : status === 'generating' || status === 'compiling' ? 'bg-cyan-400 animate-ping' : 'bg-slate-500'}`} />
+            <span className="text-[11px] font-mono uppercase text-slate-400">{status}</span>
+          </div>
         </div>
+      </div>
+
+      {/* 5-Node Stepper Pill Row */}
+      <div className="bg-[#0b1018] px-3 py-1.5 border-b border-cad-border flex items-center justify-between gap-1 overflow-x-auto">
+        {LANGGRAPH_NODES.map((node) => {
+          const isCurrent = activeNode === node.id;
+          return (
+            <div
+              key={node.id}
+              className={`px-2 py-0.5 rounded text-[10px] font-mono whitespace-nowrap border transition ${
+                isCurrent
+                  ? 'bg-cyan-500/20 text-cyan-300 border-cyan-400 font-bold animate-pulse'
+                  : status === 'completed'
+                  ? 'bg-emerald-950/40 text-emerald-400 border-emerald-800/50'
+                  : 'bg-cad-dark/60 text-slate-500 border-cad-border/50'
+              }`}
+            >
+              {node.label}
+            </div>
+          );
+        })}
       </div>
 
       {/* Terminal Output */}
@@ -65,7 +141,7 @@ export const AgentTerminal: React.FC<AgentTerminalProps> = ({ logs, status }) =>
         {logs.length === 0 ? (
           <div className="h-full flex flex-col items-center justify-center text-slate-500 text-center space-y-2 py-8">
             <Cpu className="w-8 h-8 text-slate-600 animate-pulse" />
-            <p>Agent loop idle. Upload 6-axis photos and click "Synthesize 3D CAD" to engage.</p>
+            <p>LangGraph state machine idle. Run 3D Fusion then click &quot;Synthesize 3D CAD&quot;.</p>
           </div>
         ) : (
           logs.map((log) => (
@@ -82,6 +158,8 @@ export const AgentTerminal: React.FC<AgentTerminalProps> = ({ logs, status }) =>
                   <pre className="p-2 rounded bg-black/60 border border-slate-800 text-[11px] text-emerald-300 w-full overflow-x-auto whitespace-pre font-mono">
                     {log.message}
                   </pre>
+                ) : log.log_type === 'diff' ? (
+                  renderDiffBlock(log.message)
                 ) : (
                   <p className="flex-1">{log.message}</p>
                 )}

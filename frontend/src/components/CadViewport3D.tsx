@@ -58,7 +58,11 @@ const ModelMesh: React.FC<{
 
   useFrame((_, delta) => {
     if (rotating && meshRef.current) {
-      meshRef.current.rotation.y += delta * 0.5;
+      if (stlUrl) {
+        meshRef.current.rotation.z += delta * 0.5;
+      } else {
+        meshRef.current.rotation.y += delta * 0.5;
+      }
     }
   });
 
@@ -66,7 +70,14 @@ const ModelMesh: React.FC<{
 
   return (
     <Center top>
-      <mesh ref={meshRef} geometry={geometry} castShadow receiveShadow>
+      {/* CAD STL exports use +Z up (same as Open3D PLY); BoxGeometry uses Three.js +Y up */}
+      <mesh
+        ref={meshRef}
+        geometry={geometry}
+        rotation={stlUrl ? [-Math.PI / 2, 0, 0] : [0, 0, 0]}
+        castShadow
+        receiveShadow
+      >
         <meshStandardMaterial
           color={xray ? '#00f0ff' : '#00adb5'}
           roughness={0.25}

@@ -60,7 +60,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({ generation, onClose })
                 : 'border-transparent text-slate-400 hover:text-white'
             }`}
           >
-            Parametric CadQuery Python Script
+            Parametric build123d Script (.py)
           </button>
         </div>
 
@@ -152,14 +152,25 @@ export const ExportModal: React.FC<ExportModalProps> = ({ generation, onClose })
           ) : (
             <div className="space-y-3">
               <div className="flex items-center justify-between">
-                <span className="text-xs font-mono text-slate-400">CadQuery 2.0 Python Script</span>
-                <button
-                  onClick={handleCopyCode}
-                  className="flex items-center space-x-1 px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-xs text-slate-300 transition"
-                >
-                  {copied ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
-                  <span>{copied ? 'Copied!' : 'Copy Code'}</span>
-                </button>
+                <span className="text-xs font-mono text-slate-400">build123d B-Rep Python Source (1:1 mm)</span>
+                <div className="flex items-center space-x-2">
+                  <a
+                    href={getDownloadUrl('py')}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="flex items-center space-x-1 px-2.5 py-1 rounded bg-cyan-950 hover:bg-cyan-900 border border-cyan-700 text-xs text-cyan-300 transition"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    <span>Download .py</span>
+                  </a>
+                  <button
+                    onClick={handleCopyCode}
+                    className="flex items-center space-x-1 px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-xs text-slate-300 transition"
+                  >
+                    {copied ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                    <span>{copied ? 'Copied!' : 'Copy Code'}</span>
+                  </button>
+                </div>
               </div>
               <pre className="p-4 rounded-lg bg-black border border-cad-border text-xs text-emerald-300 font-mono overflow-x-auto max-h-80 whitespace-pre">
                 {generation.code || '# No code generated yet'}
