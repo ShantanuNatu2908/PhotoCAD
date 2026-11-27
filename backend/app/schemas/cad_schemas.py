@@ -1,23 +1,25 @@
 from typing import Optional, Dict, Any, List
 from datetime import datetime
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 # --- Project Schemas ---
 class ProjectCreate(BaseModel):
-    name: str = Field(..., max_length=128, example="Mounting Bracket V1")
-    description: Optional[str] = Field(None, example="6-axis reverse engineering of an aluminum bracket")
-    unit: str = Field("mm", example="mm")
+    name: str = Field(..., max_length=128, json_schema_extra={"example": "Mounting Bracket V1"})
+    description: Optional[str] = Field(
+        None,
+        json_schema_extra={"example": "6-axis reverse engineering of an aluminum bracket"},
+    )
+    unit: str = Field("mm", json_schema_extra={"example": "mm"})
 
 class ProjectResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: str
     name: str
     description: Optional[str]
     unit: str
     created_at: datetime
     updated_at: datetime
-
-    class Config:
-        from_attributes = True
 
 # --- Scan Session Schemas ---
 class SixAxisUploadData(BaseModel):
@@ -34,6 +36,8 @@ class ViewDetail(BaseModel):
     bounding_box_mm: Optional[List[float]] = None
 
 class ScanSessionResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: str
     project_id: str
     status: Optional[str] = "capturing"
@@ -45,26 +49,24 @@ class ScanSessionResponse(BaseModel):
     views_data: Dict[str, Any]
     created_at: datetime
 
-    class Config:
-        from_attributes = True
-
 # --- Generation Schemas ---
 class GenerationTriggerRequest(BaseModel):
     scan_session_id: str
-    target_engine: str = Field("cadquery", example="cadquery") # "cadquery" or "openscad"
+    target_engine: str = Field("build123d", json_schema_extra={"example": "build123d"})
     refinement_prompt: Optional[str] = None
 
 class AgentLogResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: str
     agent_name: str
     log_type: str
     message: str
     created_at: datetime
 
-    class Config:
-        from_attributes = True
-
 class CadGenerationResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: str
     scan_session_id: str
     version: int
@@ -77,6 +79,3 @@ class CadGenerationResponse(BaseModel):
     error_log: Optional[str]
     created_at: datetime
     agent_logs: Optional[List[AgentLogResponse]] = []
-
-    class Config:
-        from_attributes = True

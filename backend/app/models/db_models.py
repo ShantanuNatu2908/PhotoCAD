@@ -1,11 +1,14 @@
 import uuid
-from datetime import datetime
-from sqlalchemy import Column, String, Integer, Float, DateTime, ForeignKey, Text, JSON, Enum
+from datetime import datetime, timezone
+from sqlalchemy import Column, String, Integer, Float, DateTime, ForeignKey, Text, JSON
 from sqlalchemy.orm import relationship
 from app.core.database import Base
 
 def generate_uuid() -> str:
     return str(uuid.uuid4())
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 class Project(Base):
     __tablename__ = "projects"
@@ -14,8 +17,8 @@ class Project(Base):
     name = Column(String(128), nullable=False)
     description = Column(Text, nullable=True)
     unit = Column(String(16), default="mm")  # "mm" or "inch"
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), default=utc_now)
+    updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
 
     # Relationships
     scan_sessions = relationship("ScanSession", back_populates="project", cascade="all, delete-orphan")
@@ -36,7 +39,7 @@ class ScanSession(Base):
     # Store paths, masks, blur scores, and summary for all 6 orthogonal views
     views_data = Column(JSON, default=dict)
     
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), default=utc_now)
 
     # Relationships
     project = relationship("Project", back_populates="scan_sessions")
@@ -51,7 +54,7 @@ class CadGeneration(Base):
     version = Column(Integer, default=1)
     status = Column(String(32), default="pending")  # pending, generating, compiling, completed, failed
     
-    # Synthesized CAD code (CadQuery or OpenSCAD)
+    # Synthesized CAD code (build123d)
     code = Column(Text, nullable=True)
     
     # File paths for exported assets
@@ -65,7 +68,7 @@ class CadGeneration(Base):
     # Compiler output / Traceback if failed
     error_log = Column(Text, nullable=True)
     
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), default=utc_now)
 
     # Relationships
     scan_session = relationship("ScanSession", back_populates="generations")
@@ -80,7 +83,7 @@ class AgentLog(Base):
     agent_name = Column(String(64), nullable=False)  # e.g., "VisionAnalyst", "CSGArchitect", "CadCoder", "Validator"
     log_type = Column(String(32), default="info")     # info, thought, code, error, success
     message = Column(Text, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), default=utc_now)
 
     # Relationships
     generation = relationship("CadGeneration", back_populates="agent_logs")

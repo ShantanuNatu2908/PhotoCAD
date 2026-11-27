@@ -23,13 +23,15 @@ from app.schemas.adt import CSGFeatureTree, FeatureStep, Open3DGeometryReport, V
 
 
 def _extract_clause_target_mm(clause: str, keywords_pattern: str) -> Optional[float]:
-    """Extracts the target millimeter dimension from a single clause, preferring 'to X mm' over 'from Y mm'."""
+    """Extracts the target millimeter dimension from a single clause, preferring 'to X [mm]' over 'from Y [mm]'."""
     if not re.search(keywords_pattern, clause):
         return None
-    to_match = re.search(r"\bto\s+(\d+(?:\.\d+)?)\s*mm\b", clause)
+    if re.search(r"\b(?:remove|delete|drop|clear|without|no)\b", clause):
+        return 0.0
+    to_match = re.search(r"\bto\s+(\d+(?:\.\d+)?)(?:\s*mm\b)?", clause)
     if to_match:
         return round(float(to_match.group(1)), 2)
-    nums = re.findall(r"(\d+(?:\.\d+)?)\s*mm\b", clause)
+    nums = re.findall(r"(\d+(?:\.\d+)?)(?:\s*mm\b)?", clause)
     if nums:
         return round(float(nums[-1]), 2)
     return None
@@ -38,7 +40,19 @@ def _extract_clause_target_mm(clause: str, keywords_pattern: str) -> Optional[fl
 def _apply_refine_instruction(params: Dict[str, float], instruction: str) -> Dict[str, float]:
     """Deterministically interprets common multi-clause mechanical edit instructions in millimeters."""
     updated = dict(params)
-    clauses = re.split(r"(?:[,;]|\.(?!\d)|\band\b)", instruction.lower())
+    lower = instruction.lower()
+
+    # Handle compact L x W x H shorthand (e.g., "100x60x25" or "120 x 70 x 30 mm")
+    dim_triple = re.search(
+        r"\b(\d+(?:\.\d+)?)\s*[x×]\s*(\d+(?:\.\d+)?)\s*[x×]\s*(\d+(?:\.\d+)?)(?:\s*mm\b)?",
+        lower,
+    )
+    if dim_triple:
+        updated["LENGTH_MM"] = round(float(dim_triple.group(1)), 2)
+        updated["WIDTH_MM"] = round(float(dim_triple.group(2)), 2)
+        updated["THICKNESS_MM"] = round(float(dim_triple.group(3)), 2)
+
+    clauses = re.split(r"(?:[,;]|\.(?!\d)|\band\b)", lower)
 
     for clause in clauses:
         if not clause.strip():

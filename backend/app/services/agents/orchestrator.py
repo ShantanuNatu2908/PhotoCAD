@@ -226,6 +226,7 @@ class AgentOrchestrator:
             if hasattr(best_metrics, "model_dump")
             else (best_metrics if isinstance(best_metrics, dict) else {})
         )
+        setattr(gen, "_latest_validation_metrics", metrics_dict)
 
         # Broadcast terminal completion envelope
         if self.ws_broadcast:

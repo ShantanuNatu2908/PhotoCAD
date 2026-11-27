@@ -1,18 +1,16 @@
 import os
-import shutil
 import uuid
 from typing import Optional, Dict, Any
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.config import settings
-from app.models.db_models import Project, ScanSession
+from app.models.db_models import AgentLog, CadGeneration, Project, ScanSession
 from app.schemas.cad_schemas import ScanSessionResponse
 from app.schemas.adt import CalibrationSpec, CaptureSide
-from app.services.vision_engine import VisionEngine
 from app.services.r2_storage import r2_storage
 from app.services.cv_pipeline_service import CVPipelineService, CVPipelineError
 
@@ -341,18 +339,14 @@ class RefineRequest(BaseModel):
     instruction: str = Field(..., min_length=3, max_length=1000)
 
 
-@router.post("/{scan_id}/generate")
-async def generate_cad_from_scan(
+async def _run_scan_cad_generation(
     scan_id: str,
-    db: AsyncSession = Depends(get_db),
-):
-    """Runs Phase 4 5-Node LangGraph B-Rep Synthesis synchronously or via scan route per PCAD-API-ADT-003."""
-    session = await db.get(ScanSession, scan_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Scan session not found")
-
+    session: ScanSession,
+    db: AsyncSession,
+    refinement_prompt: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Creates a new CadGeneration revision, executes the 5-node LangGraph pipeline, and returns artifacts + metrics."""
     from sqlalchemy.future import select
-    from app.models.db_models import CadGeneration
     from app.services.agents.orchestrator import AgentOrchestrator
     from app.main import broadcast_scan_event
 
@@ -378,7 +372,15 @@ async def generate_cad_from_scan(
         engine_type="build123d",
         scan_session_id=scan_id,
         geometry_report_json=session.geometry_report_json,
+        refinement_prompt=refinement_prompt,
     )
+
+    log_results = await db.execute(
+        select(AgentLog)
+        .where(AgentLog.generation_id == updated_gen.id)
+        .order_by(AgentLog.created_at.asc())
+    )
+    logs = list(log_results.scalars().all())
 
     return {
         "scan_id": scan_id,
@@ -393,7 +395,30 @@ async def generate_cad_from_scan(
             "dxf_url": updated_gen.dxf_file,
             "py_url": f"/api/export/{updated_gen.id}/py",
         },
+        "validation_metrics": getattr(updated_gen, "_latest_validation_metrics", None),
+        "agent_logs": [
+            {
+                "id": log.id,
+                "agent_name": log.agent_name,
+                "log_type": log.log_type,
+                "message": log.message,
+                "created_at": log.created_at.isoformat() if log.created_at else "",
+            }
+            for log in logs
+        ],
     }
+
+
+@router.post("/{scan_id}/generate")
+async def generate_cad_from_scan(
+    scan_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Runs Phase 4 5-Node LangGraph B-Rep Synthesis synchronously or via scan route per PCAD-API-ADT-003."""
+    session = await db.get(ScanSession, scan_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Scan session not found")
+    return await _run_scan_cad_generation(scan_id=scan_id, session=session, db=db)
 
 
 @router.get("/{scan_id}/revisions/{rev}/artifacts")
@@ -404,7 +429,6 @@ async def get_revision_artifacts(
 ):
     """Retrieves .STEP, .DXF, .STL, .PLY, and editable build123d .py URLs for a CAD revision."""
     from sqlalchemy.future import select
-    from app.models.db_models import CadGeneration
 
     session = await db.get(ScanSession, scan_id)
     if not session:
@@ -446,177 +470,12 @@ async def refine_cad_revision(
     session = await db.get(ScanSession, scan_id)
     if not session:
         raise HTTPException(status_code=404, detail="Scan session not found")
-
-    from sqlalchemy.future import select
-    from app.models.db_models import CadGeneration
-    from app.services.agents.orchestrator import AgentOrchestrator
-    from app.main import broadcast_scan_event
-
-    res = await db.execute(
-        select(CadGeneration).where(CadGeneration.scan_session_id == scan_id).order_by(CadGeneration.version.desc())
-    )
-    latest = res.scalars().first()
-    version = (latest.version + 1) if latest else 1
-
-    gen = CadGeneration(scan_session_id=scan_id, version=version, status="pending")
-    db.add(gen)
-    await db.commit()
-    await db.refresh(gen)
-
-    async def ws_cb(msg: Dict[str, Any]) -> None:
-        await broadcast_scan_event(scan_id, msg)
-
-    orchestrator = AgentOrchestrator(db=db, ws_broadcast=ws_cb)
-    updated_gen = await orchestrator.run_pipeline(
-        generation_id=gen.id,
-        views_data=session.views_data or {},
-        scale_ratio=session.scale_px_to_mm or 1.0,
-        engine_type="build123d",
-        scan_session_id=scan_id,
-        geometry_report_json=session.geometry_report_json,
+    return await _run_scan_cad_generation(
+        scan_id=scan_id,
+        session=session,
+        db=db,
         refinement_prompt=payload.instruction,
     )
-
-    return {
-        "scan_id": scan_id,
-        "generation_id": updated_gen.id,
-        "revision": updated_gen.version,
-        "status": updated_gen.status,
-        "dimensions_mm": updated_gen.dimensions_mm,
-        "code": updated_gen.code,
-        "artifacts": {
-            "step_url": updated_gen.step_file,
-            "stl_url": updated_gen.stl_file,
-            "dxf_url": updated_gen.dxf_file,
-            "py_url": f"/api/export/{updated_gen.id}/py",
-        },
-    }
-
-
-@router.get("/{scan_id}/revisions/{rev}/artifacts")
-async def get_revision_artifacts(
-    scan_id: str,
-    rev: int,
-    db: AsyncSession = Depends(get_db),
-):
-    """Retrieves .STEP, .DXF, .STL, .PLY, and editable build123d .py URLs for a CAD revision."""
-    from sqlalchemy.future import select
-    from app.models.db_models import CadGeneration
-
-    session = await db.get(ScanSession, scan_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Scan session not found")
-
-    res = await db.execute(
-        select(CadGeneration).where(
-            CadGeneration.scan_session_id == scan_id,
-            CadGeneration.version == rev,
-        )
-    )
-    gen = res.scalars().first()
-    if not gen:
-        raise HTTPException(status_code=404, detail=f"Revision {rev} not found")
-
-    return {
-        "scan_id": scan_id,
-        "generation_id": gen.id,
-        "revision": gen.version,
-        "status": gen.status,
-        "dimensions_mm": gen.dimensions_mm,
-        "artifacts": {
-            "step_url": f"/api/export/{gen.id}/step",
-            "dxf_url": f"/api/export/{gen.id}/dxf",
-            "stl_url": f"/api/export/{gen.id}/stl",
-            "py_url": f"/api/export/{gen.id}/py",
-            "ply_url": session.ply_file,
-        },
-    }
-
-
-# Retain legacy upload-6-axis for direct multipart form testing
-@router.post("/upload-6-axis", response_model=ScanSessionResponse)
-async def upload_six_axis_scans(
-    project_id: str = Form(...),
-    has_scale_reference: bool = Form(False),
-    marker_size_mm: float = Form(20.0),
-    front: Optional[UploadFile] = File(None),
-    back: Optional[UploadFile] = File(None),
-    left: Optional[UploadFile] = File(None),
-    right: Optional[UploadFile] = File(None),
-    top: Optional[UploadFile] = File(None),
-    bottom: Optional[UploadFile] = File(None),
-    db: AsyncSession = Depends(get_db)
-):
-    project = await db.get(Project, project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
-
-    session_id = str(uuid.uuid4())
-    session_upload_dir = settings.UPLOADS_DIR / session_id
-    session_edge_dir = settings.PROCESSED_DIR / session_id
-    session_upload_dir.mkdir(parents=True, exist_ok=True)
-    session_edge_dir.mkdir(parents=True, exist_ok=True)
-
-    views_files = {
-        "front": front,
-        "back": back,
-        "left": left,
-        "right": right,
-        "top": top,
-        "bottom": bottom
-    }
-
-    views_data: Dict[str, dict] = {}
-    calculated_scale = 1.0
-
-    saved_paths: Dict[str, str] = {}
-    for view_name, upload_file in views_files.items():
-        if upload_file:
-            ext = os.path.splitext(upload_file.filename)[1] or ".png"
-            dest_file = session_upload_dir / f"{view_name}{ext}"
-            with open(dest_file, "wb") as buffer:
-                shutil.copyfileobj(upload_file.file, buffer)
-            saved_paths[view_name] = str(dest_file)
-
-    if not saved_paths:
-        raise HTTPException(status_code=400, detail="At least one view must be provided.")
-
-    if has_scale_reference and "front" in saved_paths:
-        scale_res = VisionEngine.calculate_scale_from_marker(saved_paths["front"], marker_size_mm)
-        if scale_res:
-            calculated_scale = scale_res
-
-    for view_name, file_path in saved_paths.items():
-        try:
-            cv_result = VisionEngine.process_orthogonal_view(
-                image_path=file_path,
-                output_edge_dir=str(session_edge_dir),
-                view_name=view_name,
-                px_per_mm=calculated_scale
-            )
-            cv_result["image_url"] = f"/storage/uploads/{session_id}/{os.path.basename(file_path)}"
-            cv_result["edge_url"] = f"/storage/processed_edges/{session_id}/{view_name}_edges.png"
-            views_data[view_name] = cv_result
-        except Exception as e:
-            views_data[view_name] = {
-                "view": view_name,
-                "error": str(e),
-                "primary_dimensions_mm": [60.0, 40.0],
-                "features": []
-            }
-
-    scan_session = ScanSession(
-        id=session_id,
-        project_id=project_id,
-        has_scale_reference=1 if has_scale_reference else 0,
-        scale_px_to_mm=calculated_scale,
-        views_data=views_data
-    )
-    db.add(scan_session)
-    await db.commit()
-    await db.refresh(scan_session)
-
-    return scan_session
 
 
 @router.get("/{session_id}", response_model=ScanSessionResponse)

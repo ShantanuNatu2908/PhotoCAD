@@ -111,3 +111,48 @@ def test_async_trigger_endpoint_avoids_lazy_load_error():
     status_res = client.get(f"/api/generate/{gen_id}")
     assert status_res.status_code == 200
     assert status_res.json()["status"] in ("completed", "pending", "generating", "compiling")
+
+
+def test_refine_supports_natural_language_without_mm_suffix_and_removal():
+    """Verifies /refine handles missing 'mm' units, LxWxH triples, and 'remove hole' requests."""
+    scan_id = client.post("/api/scans", json={"project_id": "proj_refine_nlp"}).json()["scan_id"]
+    png_bytes = _make_part_png()
+
+    for side in SIX_SIDES:
+        client.put(f"/api/scans/{scan_id}/views/{side}/upload", content=png_bytes)
+        client.post(f"/api/scans/{scan_id}/views/{side}/confirm", json={"blur_score": 190.0})
+
+    client.post(f"/api/scans/{scan_id}/calibrate", json={
+        "mode": "known_dimension",
+        "reference_side": "front",
+        "known_length_mm": 80.0,
+        "point_a_px": [70.0, 120.0],
+        "point_b_px": [250.0, 120.0],
+    })
+    assert client.post(f"/api/scans/{scan_id}/fuse").status_code == 200
+    assert client.post(f"/api/scans/{scan_id}/generate").status_code == 200
+
+    # Refine without 'mm' unit suffix and with LxWxH shorthand
+    ref1 = client.post(f"/api/scans/{scan_id}/refine", json={
+        "base_revision": 1,
+        "instruction": "change hole to 14 and 100x60x25",
+    })
+    assert ref1.status_code == 200
+    body1 = ref1.json()
+    assert body1["dimensions_mm"]["x"] == 100.0
+    assert body1["dimensions_mm"]["y"] == 60.0
+    assert body1["dimensions_mm"]["z"] == 25.0
+    assert "HOLE_DIA_MM = 14.00" in body1["code"]
+    assert isinstance(body1.get("agent_logs"), list) and len(body1["agent_logs"]) > 0
+    assert isinstance(body1.get("validation_metrics"), dict)
+
+    # Remove center hole cleanly (no hole constant or subtractive cylinder emitted)
+    ref2 = client.post(f"/api/scans/{scan_id}/refine", json={
+        "base_revision": 2,
+        "instruction": "remove center hole",
+    })
+    assert ref2.status_code == 200
+    body2 = ref2.json()
+    assert "HOLE_DIA_MM" not in body2["code"]
+    assert "Mode.SUBTRACT" not in body2["code"]
+    assert body2["dimensions_mm"]["x"] == 100.0
