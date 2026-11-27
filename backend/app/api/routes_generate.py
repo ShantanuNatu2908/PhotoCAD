@@ -9,32 +9,46 @@ from app.services.agents.orchestrator import AgentOrchestrator
 
 router = APIRouter(prefix="/generate", tags=["Generation"])
 
-async def run_pipeline_task(generation_id: str, scan_session_id: str, engine_type: str):
-    """Background task to run multi-agent pipeline with its own DB session."""
+async def run_pipeline_task(
+    generation_id: str,
+    scan_session_id: str,
+    engine_type: str,
+    refinement_prompt: str | None = None,
+):
+    """Background task to run multi-agent LangGraph pipeline with WebSocket broadcasting."""
+    from app.main import broadcast_scan_event, ws_manager
+
     async with AsyncSessionLocal() as db:
         session = await db.get(ScanSession, scan_session_id)
         if not session:
             return
-            
-        orchestrator = AgentOrchestrator(db=db)
+
+        async def ws_cb(msg: dict) -> None:
+            await ws_manager.broadcast_to_generation(generation_id, msg)
+            await broadcast_scan_event(scan_session_id, msg)
+
+        orchestrator = AgentOrchestrator(db=db, ws_broadcast=ws_cb)
         await orchestrator.run_pipeline(
             generation_id=generation_id,
             views_data=session.views_data or {},
             scale_ratio=session.scale_px_to_mm or 1.0,
-            engine_type=engine_type
+            engine_type=engine_type,
+            scan_session_id=session.id,
+            geometry_report_json=session.geometry_report_json,
+            refinement_prompt=refinement_prompt,
         )
+
 
 @router.post("/trigger", response_model=CadGenerationResponse)
 async def trigger_cad_generation(
     req: GenerationTriggerRequest,
     background_tasks: BackgroundTasks,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
     session = await db.get(ScanSession, req.scan_session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Scan session not found")
 
-    # Get latest version number
     result = await db.execute(
         select(CadGeneration)
         .where(CadGeneration.scan_session_id == req.scan_session_id)
@@ -46,18 +60,18 @@ async def trigger_cad_generation(
     generation = CadGeneration(
         scan_session_id=req.scan_session_id,
         version=new_version,
-        status="pending"
+        status="pending",
     )
     db.add(generation)
     await db.commit()
     await db.refresh(generation)
 
-    # Launch multi-agent pipeline as a background task
     background_tasks.add_task(
         run_pipeline_task,
         generation.id,
         req.scan_session_id,
-        req.target_engine
+        req.target_engine,
+        req.refinement_prompt,
     )
 
     return generation

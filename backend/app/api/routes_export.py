@@ -36,7 +36,8 @@ async def download_cad_file(
         "step": "application/step",
         "stp": "application/step",
         "stl": "model/stl",
-        "dxf": "application/dxf"
+        "dxf": "application/dxf",
+        "py": "text/x-python",
     }
 
     return FileResponse(

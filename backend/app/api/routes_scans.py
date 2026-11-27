@@ -336,6 +336,203 @@ async def get_scan_geometry_report(
     }
 
 
+class RefineRequest(BaseModel):
+    base_revision: int = Field(default=1, ge=1)
+    instruction: str = Field(..., min_length=3, max_length=1000)
+
+
+@router.post("/{scan_id}/generate")
+async def generate_cad_from_scan(
+    scan_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Runs Phase 4 5-Node LangGraph B-Rep Synthesis synchronously or via scan route per PCAD-API-ADT-003."""
+    session = await db.get(ScanSession, scan_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Scan session not found")
+
+    from sqlalchemy.future import select
+    from app.models.db_models import CadGeneration
+    from app.services.agents.orchestrator import AgentOrchestrator
+    from app.main import broadcast_scan_event
+
+    res = await db.execute(
+        select(CadGeneration).where(CadGeneration.scan_session_id == scan_id).order_by(CadGeneration.version.desc())
+    )
+    latest = res.scalars().first()
+    version = (latest.version + 1) if latest else 1
+
+    gen = CadGeneration(scan_session_id=scan_id, version=version, status="pending")
+    db.add(gen)
+    await db.commit()
+    await db.refresh(gen)
+
+    async def ws_cb(msg: Dict[str, Any]) -> None:
+        await broadcast_scan_event(scan_id, msg)
+
+    orchestrator = AgentOrchestrator(db=db, ws_broadcast=ws_cb)
+    updated_gen = await orchestrator.run_pipeline(
+        generation_id=gen.id,
+        views_data=session.views_data or {},
+        scale_ratio=session.scale_px_to_mm or 1.0,
+        engine_type="build123d",
+        scan_session_id=scan_id,
+        geometry_report_json=session.geometry_report_json,
+    )
+
+    return {
+        "scan_id": scan_id,
+        "generation_id": updated_gen.id,
+        "revision": updated_gen.version,
+        "status": updated_gen.status,
+        "dimensions_mm": updated_gen.dimensions_mm,
+        "code": updated_gen.code,
+        "artifacts": {
+            "step_url": updated_gen.step_file,
+            "stl_url": updated_gen.stl_file,
+            "dxf_url": updated_gen.dxf_file,
+            "py_url": f"/api/export/{updated_gen.id}/py",
+        },
+    }
+
+
+@router.get("/{scan_id}/revisions/{rev}/artifacts")
+async def get_revision_artifacts(
+    scan_id: str,
+    rev: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """Retrieves .STEP, .DXF, .STL, .PLY, and editable build123d .py URLs for a CAD revision."""
+    from sqlalchemy.future import select
+    from app.models.db_models import CadGeneration
+
+    session = await db.get(ScanSession, scan_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Scan session not found")
+
+    res = await db.execute(
+        select(CadGeneration).where(
+            CadGeneration.scan_session_id == scan_id,
+            CadGeneration.version == rev,
+        )
+    )
+    gen = res.scalars().first()
+    if not gen:
+        raise HTTPException(status_code=404, detail=f"Revision {rev} not found")
+
+    return {
+        "scan_id": scan_id,
+        "generation_id": gen.id,
+        "revision": gen.version,
+        "status": gen.status,
+        "dimensions_mm": gen.dimensions_mm,
+        "artifacts": {
+            "step_url": f"/api/export/{gen.id}/step",
+            "dxf_url": f"/api/export/{gen.id}/dxf",
+            "stl_url": f"/api/export/{gen.id}/stl",
+            "py_url": f"/api/export/{gen.id}/py",
+            "ply_url": session.ply_file,
+        },
+    }
+
+
+@router.post("/{scan_id}/refine")
+async def refine_cad_revision(
+    scan_id: str,
+    payload: RefineRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Resumes the saved LangGraph thread checkpoint to apply parametric edits in <15s (PCAD-LG-004)."""
+    session = await db.get(ScanSession, scan_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Scan session not found")
+
+    from sqlalchemy.future import select
+    from app.models.db_models import CadGeneration
+    from app.services.agents.orchestrator import AgentOrchestrator
+    from app.main import broadcast_scan_event
+
+    res = await db.execute(
+        select(CadGeneration).where(CadGeneration.scan_session_id == scan_id).order_by(CadGeneration.version.desc())
+    )
+    latest = res.scalars().first()
+    version = (latest.version + 1) if latest else 1
+
+    gen = CadGeneration(scan_session_id=scan_id, version=version, status="pending")
+    db.add(gen)
+    await db.commit()
+    await db.refresh(gen)
+
+    async def ws_cb(msg: Dict[str, Any]) -> None:
+        await broadcast_scan_event(scan_id, msg)
+
+    orchestrator = AgentOrchestrator(db=db, ws_broadcast=ws_cb)
+    updated_gen = await orchestrator.run_pipeline(
+        generation_id=gen.id,
+        views_data=session.views_data or {},
+        scale_ratio=session.scale_px_to_mm or 1.0,
+        engine_type="build123d",
+        scan_session_id=scan_id,
+        geometry_report_json=session.geometry_report_json,
+        refinement_prompt=payload.instruction,
+    )
+
+    return {
+        "scan_id": scan_id,
+        "generation_id": updated_gen.id,
+        "revision": updated_gen.version,
+        "status": updated_gen.status,
+        "dimensions_mm": updated_gen.dimensions_mm,
+        "code": updated_gen.code,
+        "artifacts": {
+            "step_url": updated_gen.step_file,
+            "stl_url": updated_gen.stl_file,
+            "dxf_url": updated_gen.dxf_file,
+            "py_url": f"/api/export/{updated_gen.id}/py",
+        },
+    }
+
+
+@router.get("/{scan_id}/revisions/{rev}/artifacts")
+async def get_revision_artifacts(
+    scan_id: str,
+    rev: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """Retrieves .STEP, .DXF, .STL, .PLY, and editable build123d .py URLs for a CAD revision."""
+    from sqlalchemy.future import select
+    from app.models.db_models import CadGeneration
+
+    session = await db.get(ScanSession, scan_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Scan session not found")
+
+    res = await db.execute(
+        select(CadGeneration).where(
+            CadGeneration.scan_session_id == scan_id,
+            CadGeneration.version == rev,
+        )
+    )
+    gen = res.scalars().first()
+    if not gen:
+        raise HTTPException(status_code=404, detail=f"Revision {rev} not found")
+
+    return {
+        "scan_id": scan_id,
+        "generation_id": gen.id,
+        "revision": gen.version,
+        "status": gen.status,
+        "dimensions_mm": gen.dimensions_mm,
+        "artifacts": {
+            "step_url": f"/api/export/{gen.id}/step",
+            "dxf_url": f"/api/export/{gen.id}/dxf",
+            "stl_url": f"/api/export/{gen.id}/stl",
+            "py_url": f"/api/export/{gen.id}/py",
+            "ply_url": session.ply_file,
+        },
+    }
+
+
 # Retain legacy upload-6-axis for direct multipart form testing
 @router.post("/upload-6-axis", response_model=ScanSessionResponse)
 async def upload_six_axis_scans(
