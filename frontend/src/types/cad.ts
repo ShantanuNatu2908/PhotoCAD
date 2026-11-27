@@ -124,7 +124,7 @@ export interface CadGeneration {
   id: string;
   scan_session_id: string;
   version: number;
-  status: 'pending' | 'generating' | 'compiling' | 'completed' | 'failed';
+  status: 'pending' | 'generating' | 'compiling' | 'completed' | 'completed_with_warning' | 'failed';
   code?: string;
   step_file?: string;
   dxf_file?: string;

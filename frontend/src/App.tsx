@@ -138,11 +138,24 @@ export const App: React.FC = () => {
         if (res.ok) {
           const updated: CadGeneration = await res.json();
           setGeneration(updated);
-          if (updated.agent_logs) {
-            setAgentLogs(updated.agent_logs);
+          if (updated.agent_logs && updated.agent_logs.length > 0) {
+            setAgentLogs((prev) => {
+              const seen = new Set(prev.map((l) => `${l.agent_name}:${l.log_type}:${l.message}`));
+              const merged = [...prev];
+              for (const item of updated.agent_logs || []) {
+                const sig = `${item.agent_name}:${item.log_type}:${item.message}`;
+                if (!seen.has(sig)) {
+                  seen.add(sig);
+                  merged.push(item);
+                }
+              }
+              return merged;
+            });
           }
           if (updated.status === 'completed' || updated.status === 'failed') {
             setIsGenerating(false);
+            setActiveLangGraphNode(null);
+            setSystemStatus(updated.status === 'completed' ? 'Verified .STEP Ready' : 'Synthesis Failed');
           }
         }
       } catch (e) {
@@ -530,7 +543,7 @@ export const App: React.FC = () => {
               )}
             </button>
 
-            {generation?.status === 'completed' && (
+            {(generation?.status === 'completed' || generation?.status === 'completed_with_warning') && (
               <button
                 onClick={() => setShowExportModal(true)}
                 className="flex items-center space-x-2 px-4 py-2.5 rounded-lg bg-emerald-950 text-emerald-300 border border-emerald-700 hover:bg-emerald-900 transition font-mono text-xs font-semibold shadow-md"
@@ -602,9 +615,11 @@ export const App: React.FC = () => {
                 </div>
                 <div className="grid grid-cols-3 gap-2 text-[11px] text-slate-300 bg-cad-dark/70 p-2 rounded border border-cad-border">
                   <div>
-                    <span className="text-slate-500 block">BBox (mm)</span>
+                    <span className="text-slate-500 block">BBox ({unit})</span>
                     <span className="font-bold text-white">
-                      {geometryReport.bounding_box_mm.join('×')}
+                      {geometryReport.bounding_box_mm
+                        .map((v) => (unit === 'inch' ? (v / 25.4).toFixed(2) : v.toFixed(1)))
+                        .join('×')}
                     </span>
                   </div>
                   <div>
@@ -660,7 +675,9 @@ export const App: React.FC = () => {
               />
             </div>
 
-            {generation?.status === 'completed' && scanSessionId && !scanSessionId.startsWith('demo-') && (
+            {(generation?.status === 'completed' || generation?.status === 'completed_with_warning') &&
+              scanSessionId &&
+              !scanSessionId.startsWith('demo-') && (
               <form
                 onSubmit={handleRefineCAD}
                 className="flex items-center gap-2 bg-cad-card border border-cyan-800/60 p-2.5 rounded-xl shadow-md"
