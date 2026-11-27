@@ -34,6 +34,12 @@ GOLDEN_PARTS = [
     ("precision_l_blank", 110.0, 65.0, 42.0, 0.0),
     ("flanged_collar_block", 60.0, 60.0, 28.0, 14.0),
     ("metric_shim_spacer", 45.0, 30.0, 6.0, 5.0),
+    ("heavy_bearing_block", 95.0, 72.0, 36.0, 18.0),
+    ("stepper_motor_faceplate", 42.3, 42.3, 8.0, 11.0),
+    ("t_slot_carriage_body", 100.0, 60.0, 22.0, 0.0),
+    ("encoder_housing_base", 75.0, 75.0, 40.0, 16.0),
+    ("cnc_spindle_clamp", 120.0, 85.0, 30.0, 24.0),
+    ("sensor_bracket_pad", 52.0, 34.0, 10.5, 4.5),
 ]
 
 

@@ -9,6 +9,7 @@ artifact revision across iterations so later iterations can never regress output
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from typing import Any, Dict
 
@@ -27,10 +28,12 @@ async def geometric_validator_node(state: PhotoCADGraphState) -> Dict[str, Any]:
     stl_path = artifacts.get("stl_path", "")
     ply_path = state.get("ply_local_path")
 
-    metrics = ChamferValidator.evaluate(
-        stl_path=stl_path,
-        geometry_report=report,
-        ply_path=ply_path,
+    # Offload CPU-heavy surface sampling & distance math off the asyncio event loop
+    metrics = await asyncio.to_thread(
+        ChamferValidator.evaluate,
+        stl_path,
+        report,
+        ply_path,
     )
 
     next_iter = state.get("geometry_iterations", 0) + 1

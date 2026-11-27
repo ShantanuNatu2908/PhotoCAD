@@ -92,3 +92,22 @@ def test_full_scan_fuse_generate_refine_export_flow():
     assert art_res.status_code == 200
     assert art_res.json()["revision"] == 2
     assert art_res.json()["artifacts"]["step_url"].endswith("/step")
+
+
+def test_async_trigger_endpoint_avoids_lazy_load_error():
+    """Regression test: POST /api/generate/trigger must serialize cleanly under AsyncSession."""
+    scan_id = client.post("/api/scans", json={"project_id": "proj_async_trigger"}).json()["scan_id"]
+    trig = client.post("/api/generate/trigger", json={
+        "scan_session_id": scan_id,
+        "target_engine": "build123d",
+    })
+    assert trig.status_code == 200
+    data = trig.json()
+    assert "id" in data
+    assert data["agent_logs"] == []
+
+    # Verify status endpoint returns populated generation & logs
+    gen_id = data["id"]
+    status_res = client.get(f"/api/generate/{gen_id}")
+    assert status_res.status_code == 200
+    assert status_res.json()["status"] in ("completed", "pending", "generating", "compiling")

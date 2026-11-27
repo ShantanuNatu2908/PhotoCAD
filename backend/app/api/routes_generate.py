@@ -74,19 +74,45 @@ async def trigger_cad_generation(
         req.refinement_prompt,
     )
 
-    return generation
+    return CadGenerationResponse(
+        id=generation.id,
+        scan_session_id=generation.scan_session_id,
+        version=generation.version,
+        status=generation.status,
+        code=generation.code,
+        step_file=generation.step_file,
+        dxf_file=generation.dxf_file,
+        stl_file=generation.stl_file,
+        dimensions_mm=generation.dimensions_mm,
+        error_log=generation.error_log,
+        created_at=generation.created_at,
+        agent_logs=[],
+    )
+
 
 @router.get("/{generation_id}", response_model=CadGenerationResponse)
 async def get_generation_status(generation_id: str, db: AsyncSession = Depends(get_db)):
     generation = await db.get(CadGeneration, generation_id)
     if not generation:
         raise HTTPException(status_code=404, detail="Generation not found")
-        
-    # Load associated agent logs
+
     log_results = await db.execute(
         select(AgentLog)
         .where(AgentLog.generation_id == generation_id)
         .order_by(AgentLog.created_at.asc())
     )
-    generation.agent_logs = log_results.scalars().all()
-    return generation
+    logs = list(log_results.scalars().all())
+    return CadGenerationResponse(
+        id=generation.id,
+        scan_session_id=generation.scan_session_id,
+        version=generation.version,
+        status=generation.status,
+        code=generation.code,
+        step_file=generation.step_file,
+        dxf_file=generation.dxf_file,
+        stl_file=generation.stl_file,
+        dimensions_mm=generation.dimensions_mm,
+        error_log=generation.error_log,
+        created_at=generation.created_at,
+        agent_logs=logs,
+    )
