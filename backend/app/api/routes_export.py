@@ -6,8 +6,34 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.core.config import settings
 from app.models.db_models import CadGeneration
+from app.cad.interop_verifier import InteropVerifier
 
 router = APIRouter(prefix="/export", tags=["Export"])
+
+
+@router.get("/{generation_id}/interop-report")
+async def get_cad_interoperability_report(
+    generation_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Runs AutoCAD, Fusion 360, and SolidWorks structural & 1:1 mm compatibility verification
+    against exported .STEP, .DXF, and .STL files for a completed CAD generation.
+    """
+    gen = await db.get(CadGeneration, generation_id)
+    if not gen:
+        raise HTTPException(status_code=404, detail="CAD Generation not found")
+
+    step_path = settings.EXPORTS_DIR / f"{generation_id}.step"
+    dxf_path = settings.EXPORTS_DIR / f"{generation_id}.dxf"
+    stl_path = settings.EXPORTS_DIR / f"{generation_id}.stl"
+
+    report = InteropVerifier.verify_bundle(step_path, dxf_path, stl_path)
+    return {
+        "generation_id": generation_id,
+        "dimensions_mm": gen.dimensions_mm,
+        **report.model_dump(),
+    }
 
 @router.get("/{generation_id}/{file_format}")
 async def download_cad_file(
