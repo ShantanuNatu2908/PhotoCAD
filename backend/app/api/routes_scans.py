@@ -2,7 +2,8 @@ import os
 import shutil
 import uuid
 from typing import Optional, Dict, Any
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Body
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -12,6 +13,8 @@ from app.models.db_models import Project, ScanSession
 from app.schemas.cad_schemas import ScanSessionResponse
 from app.schemas.adt import CalibrationSpec, CaptureSide
 from app.services.vision_engine import VisionEngine
+from app.services.r2_storage import r2_storage
+from app.services.cv_pipeline_service import CVPipelineService, CVPipelineError
 
 router = APIRouter(prefix="/scans", tags=["Scans"])
 
@@ -62,16 +65,21 @@ async def create_scan_session(
     session_upload_dir = settings.UPLOADS_DIR / scan_id
     session_upload_dir.mkdir(parents=True, exist_ok=True)
 
-    # In dev, upload endpoints point to local storage or Cloudflare R2
-    r2_public = os.getenv("CLOUDFLARE_R2_PUBLIC_URL", "http://localhost:8000/storage/uploads")
+    # In cloud mode issue SigV4 R2 PUT URLs; in local dev issue backend PUT upload URLs
+    public_api_base = os.getenv("PUBLIC_API_BASE", "http://localhost:8000").rstrip("/")
     upload_urls = {
-        side.value: f"{r2_public}/{scan_id}/{side.value}.png"
+        side.value: (
+            r2_storage.generate_presigned_url(f"uploads/{scan_id}/{side.value}.png", method="PUT", expires_in=900)
+            if r2_storage.is_r2_configured
+            else f"{public_api_base}/api/scans/{scan_id}/views/{side.value}/upload"
+        )
         for side in CaptureSide
     }
 
     scan_session = ScanSession(
         id=scan_id,
         project_id=project.id,
+        status="capturing",
         has_scale_reference=0,
         scale_px_to_mm=1.0,
         views_data={side.value: {"status": "pending"} for side in CaptureSide}
@@ -85,6 +93,41 @@ async def create_scan_session(
         upload_urls=upload_urls,
         expires_in_seconds=900
     )
+
+
+@router.put("/{scan_id}/views/{side}/upload")
+async def upload_raw_keyframe_bytes(
+    scan_id: str,
+    side: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Dev-mode direct binary PUT endpoint mirroring Cloudflare R2 pre-signed PUT uploads.
+    Persists raw uncompressed .PNG bytes under storage/uploads/{scan_id}/{side}.png.
+    """
+    session = await db.get(ScanSession, scan_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Scan session not found")
+
+    side_lower = side.lower()
+    valid_sides = [s.value for s in CaptureSide]
+    if side_lower not in valid_sides:
+        raise HTTPException(status_code=400, detail=f"Invalid capture side '{side}'. Must be one of {valid_sides}")
+
+    raw_bytes = await request.body()
+    if not raw_bytes:
+        raise HTTPException(status_code=400, detail="Empty PNG payload")
+
+    object_key = f"uploads/{scan_id}/{side_lower}.png"
+    r2_storage.save_local_bytes(object_key, raw_bytes)
+
+    return {
+        "scan_id": scan_id,
+        "side": side_lower,
+        "bytes_written": len(raw_bytes),
+        "image_url": f"/storage/{object_key}",
+    }
 
 
 @router.post("/{scan_id}/views/{side}/confirm", response_model=ViewConfirmResponse)
@@ -107,11 +150,14 @@ async def confirm_view_keyframe(
     if side_lower not in valid_sides:
         raise HTTPException(status_code=400, detail=f"Invalid capture side '{side}'. Must be one of {valid_sides}")
 
-    views = session.views_data or {}
+    is_sharp = payload.blur_score >= 120.0
+    view_status = "confirmed" if is_sharp else "rejected_blur"
+
+    views = dict(session.views_data or {})
     views[side_lower] = {
-        "status": "confirmed",
+        "status": view_status,
         "blur_score": payload.blur_score,
-        "is_sharp": payload.blur_score >= 120.0,
+        "is_sharp": is_sharp,
         "width_px": payload.width_px,
         "height_px": payload.height_px,
         "image_url": payload.image_url or f"/storage/uploads/{scan_id}/{side_lower}.png"
@@ -120,14 +166,17 @@ async def confirm_view_keyframe(
     session.views_data = views
     await db.commit()
 
-    completed_count = sum(1 for v in views.values() if v.get("status") == "confirmed")
+    completed_count = sum(
+        1 for k, v in views.items()
+        if not k.startswith("_") and isinstance(v, dict) and v.get("status") == "confirmed"
+    )
 
     return ViewConfirmResponse(
         scan_id=scan_id,
         side=side_lower,
-        status="confirmed",
+        status=view_status,
         blur_score=payload.blur_score,
-        is_sharp=payload.blur_score >= 120.0,
+        is_sharp=is_sharp,
         views_completed=completed_count
     )
 
@@ -150,18 +199,23 @@ async def calibrate_metric_scale(
     if spec.mm_per_unit and spec.mm_per_unit > 0:
         scale_factor = spec.mm_per_unit
     elif spec.point_a_px and spec.point_b_px:
-        # Compute px distance and scale
         dx = spec.point_b_px[0] - spec.point_a_px[0]
         dy = spec.point_b_px[1] - spec.point_a_px[1]
         px_dist = (dx**2 + dy**2)**0.5
         if px_dist > 0:
             scale_factor = spec.known_length_mm / px_dist
 
+    spec_dict = spec.model_dump()
+    if spec_dict.get("mm_per_unit") is None:
+        spec_dict["mm_per_unit"] = round(scale_factor, 5)
+
+    session.status = "calibrated"
     session.has_scale_reference = 1
     session.scale_px_to_mm = round(scale_factor, 5)
+    session.calibration_json = spec_dict
 
-    views = session.views_data or {}
-    views["_calibration"] = spec.model_dump()
+    views = dict(session.views_data or {})
+    views["_calibration"] = spec_dict
     session.views_data = views
 
     await db.commit()
@@ -170,7 +224,115 @@ async def calibrate_metric_scale(
         "scan_id": scan_id,
         "status": "calibrated",
         "scale_px_to_mm": session.scale_px_to_mm,
-        "calibration_spec": spec.model_dump()
+        "calibration_spec": spec_dict
+    }
+
+
+@router.post("/{scan_id}/fuse")
+async def trigger_cv_3d_fusion(
+    scan_id: str,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Phase 3 Entrypoint: Executes SAM 2.1 Masking -> Depth Anything -> Open3D 6-Side Fusion
+    (via Modal L4 GPU when configured or Zero-Heat fallback in local dev) and persists
+    the metric-scaled .PLY point cloud and Open3DGeometryReport ADT.
+    """
+    session = await db.get(ScanSession, scan_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Scan session not found")
+
+    from app.main import broadcast_scan_event
+
+    async def ws_cb(msg: Dict[str, Any]) -> None:
+        await broadcast_scan_event(scan_id, msg)
+
+    session.status = "processing_cv"
+    await db.commit()
+
+    try:
+        result = await CVPipelineService.run_cv_fusion(
+            scan_id=scan_id,
+            views_data=session.views_data or {},
+            has_scale_reference=bool(session.has_scale_reference),
+            calibration_spec=session.calibration_json,
+            ws_broadcast=ws_cb,
+        )
+    except CVPipelineError as exc:
+        session.status = "failed"
+        await db.commit()
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={
+                "error": {
+                    "code": exc.code,
+                    "message": exc.message,
+                    "details": exc.details,
+                    "request_id": f"req_{uuid.uuid4().hex[:12]}",
+                }
+            },
+        )
+
+    views = dict(session.views_data or {})
+    for side, masked_url in (result.get("masked_urls") or {}).items():
+        if side in views and isinstance(views[side], dict):
+            updated_view = dict(views[side])
+            updated_view["masked_url"] = masked_url
+            views[side] = updated_view
+
+    session.views_data = views
+    session.geometry_report_json = result["geometry_report"]
+    session.ply_file = result["ply_url"]
+    session.status = "fused"
+    await db.commit()
+
+    return {
+        "scan_id": scan_id,
+        "status": "fused",
+        "execution_mode": result["execution_mode"],
+        "ply_url": result["ply_url"],
+        "masked_urls": result["masked_urls"],
+        "geometry_report": result["geometry_report"],
+        "telemetry": result["telemetry"],
+    }
+
+
+@router.get("/{scan_id}/geometry")
+async def get_scan_geometry_report(
+    scan_id: str,
+    db: AsyncSession = Depends(get_db)
+):
+    """Returns the fused Open3DGeometryReport ADT and downloadable .PLY preview URL."""
+    session = await db.get(ScanSession, scan_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Scan session not found")
+
+    if not session.geometry_report_json:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": {
+                    "code": "FUSION_NOT_READY",
+                    "message": "3D geometry report has not been generated yet. Call POST /fuse first.",
+                    "details": {"scan_id": scan_id, "status": session.status},
+                    "request_id": f"req_{uuid.uuid4().hex[:12]}",
+                }
+            },
+        )
+
+    views = session.views_data or {}
+    masked_urls = {
+        side.value: views[side.value].get("masked_url")
+        for side in CaptureSide
+        if side.value in views and isinstance(views[side.value], dict) and views[side.value].get("masked_url")
+    }
+
+    return {
+        "scan_id": scan_id,
+        "status": session.status,
+        "ply_url": session.ply_file,
+        "masked_urls": masked_urls,
+        "geometry_report": session.geometry_report_json,
     }
 
 

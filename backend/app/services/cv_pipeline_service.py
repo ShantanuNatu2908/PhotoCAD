@@ -100,14 +100,24 @@ def _extract_dev_foreground_mask(rgb_arr: np.ndarray) -> Tuple[np.ndarray, int]:
     color_dist = np.linalg.norm(rgb_arr.astype(np.float32) - bg_median.astype(np.float32), axis=-1)
 
     ycrcb = cv2.cvtColor(rgb_arr, cv2.COLOR_RGB2YCrCb)
-    skin_mask = cv2.inRange(ycrcb, np.array([40, 133, 77]), np.array([245, 173, 127])) > 0
+    skin_u8 = cv2.inRange(ycrcb, np.array([40, 133, 77]), np.array([245, 173, 127]))
 
-    fg_mask = color_dist > 22.0
-    # Remove skin pixels only near outer edges
-    edge_band = np.ones((h, w), dtype=bool)
-    edge_band[int(h * 0.12):int(h * 0.88), int(w * 0.12):int(w * 0.88)] = False
-    hand_suppressed = int(np.sum(skin_mask & edge_band))
-    fg_mask = fg_mask & ~(skin_mask & edge_band)
+    # Remove whole skin components connected to the frame perimeter (hands/fingers holding part)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(skin_u8, connectivity=8)
+    hand_mask = np.zeros((h, w), dtype=bool)
+    margin_x, margin_y = max(3, int(w * 0.03)), max(3, int(h * 0.03))
+    for lbl in range(1, num_labels):
+        x, y, bw, bh, area = stats[lbl]
+        if area < 25:
+            continue
+        touches_border = (
+            x <= margin_x or y <= margin_y or (x + bw) >= (w - margin_x) or (y + bh) >= (h - margin_y)
+        )
+        if touches_border:
+            hand_mask |= (labels == lbl)
+
+    hand_suppressed = int(np.sum(hand_mask))
+    fg_mask = (color_dist > 22.0) & ~hand_mask
 
     # If the synthetic image is solid or uniform without sharp BG separation, preserve central 60% ROI
     if float(np.mean(fg_mask)) < 0.03:
