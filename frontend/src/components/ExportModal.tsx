@@ -1,5 +1,5 @@
-import React, { useState } from 'react';
-import { Download, Check, Copy, Box, Layers, Scissors } from 'lucide-react';
+import React, { useState, useEffect } from 'react';
+import { Download, Check, Copy, Box, Layers, Scissors, ShieldCheck } from 'lucide-react';
 import type { CadGeneration } from '../types/cad';
 
 interface ExportModalProps {
@@ -7,9 +7,45 @@ interface ExportModalProps {
   onClose: () => void;
 }
 
+interface InteropReportData {
+  autocad_compatible: boolean;
+  fusion360_compatible: boolean;
+  solidworks_compatible: boolean;
+  step: {
+    valid: boolean;
+    schema_protocol: string;
+    units_millimeters: boolean;
+    entity_count: number;
+    dangling_references: number[];
+    bounding_box_mm: [number, number, number];
+  };
+  dxf: {
+    valid: boolean;
+    insunits_mm: boolean;
+    line_count: number;
+    circle_count: number;
+  };
+  stl: {
+    valid: boolean;
+    is_watertight: boolean;
+    volume_mm3: number;
+  };
+}
+
 export const ExportModal: React.FC<ExportModalProps> = ({ generation, onClose }) => {
   const [copied, setCopied] = useState(false);
   const [activeTab, setActiveTab] = useState<'download' | 'code'>('download');
+  const [interop, setInterop] = useState<InteropReportData | null>(null);
+
+  useEffect(() => {
+    if (!generation.id || generation.id.startsWith('demo-')) return;
+    fetch(`http://localhost:8000/api/export/${generation.id}/interop-report`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (data) setInterop(data as InteropReportData);
+      })
+      .catch(() => {});
+  }, [generation.id]);
 
   const handleCopyCode = () => {
     if (generation.code) {
@@ -73,7 +109,6 @@ export const ExportModal: React.FC<ExportModalProps> = ({ generation, onClose })
               </p>
 
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-2">
-                {/* STEP Export */}
                 <a
                   href={getDownloadUrl('step')}
                   target="_blank"
@@ -86,7 +121,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({ generation, onClose })
                       <Box className="w-4 h-4 text-cyan-400" />
                     </div>
                     <p className="text-[11px] text-slate-300">
-                      Standard Parametric B-Rep Solid.
+                      ISO 10303-21 AP214 B-Rep Solid.
                     </p>
                     <p className="text-[10px] text-slate-500 mt-1">
                       AutoCAD, SolidWorks, Fusion 360, FreeCAD
@@ -98,7 +133,6 @@ export const ExportModal: React.FC<ExportModalProps> = ({ generation, onClose })
                   </div>
                 </a>
 
-                {/* DXF Export */}
                 <a
                   href={getDownloadUrl('dxf')}
                   target="_blank"
@@ -111,10 +145,10 @@ export const ExportModal: React.FC<ExportModalProps> = ({ generation, onClose })
                       <Layers className="w-4 h-4 text-purple-400" />
                     </div>
                     <p className="text-[11px] text-slate-300">
-                      2D Engineering Blueprint Vector.
+                      3-View Orthographic CAD Blueprint.
                     </p>
                     <p className="text-[10px] text-slate-500 mt-1">
-                      AutoCAD Technical Shop Drawings & CNC
+                      AutoCAD ($INSUNITS=4 mm) & CNC
                     </p>
                   </div>
                   <div className="mt-4 flex items-center space-x-1.5 text-xs text-purple-300 font-mono font-medium">
@@ -123,7 +157,6 @@ export const ExportModal: React.FC<ExportModalProps> = ({ generation, onClose })
                   </div>
                 </a>
 
-                {/* STL Export */}
                 <a
                   href={getDownloadUrl('stl')}
                   target="_blank"
@@ -136,7 +169,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({ generation, onClose })
                       <Scissors className="w-4 h-4 text-amber-400" />
                     </div>
                     <p className="text-[11px] text-slate-300">
-                      3D Printing Slicer Mesh.
+                      Watertight 2-Manifold Mesh.
                     </p>
                     <p className="text-[10px] text-slate-500 mt-1">
                       Cura, PrusaSlicer, Bambu Studio
@@ -148,6 +181,32 @@ export const ExportModal: React.FC<ExportModalProps> = ({ generation, onClose })
                   </div>
                 </a>
               </div>
+
+              {/* Interoperability Checklist */}
+              {interop && (
+                <div className="mt-4 p-3.5 rounded-xl bg-emerald-950/25 border border-emerald-700/60 text-xs font-mono space-y-2">
+                  <div className="flex items-center justify-between text-emerald-300 font-semibold">
+                    <span className="flex items-center gap-1.5">
+                      <ShieldCheck className="w-4 h-4 text-emerald-400" />
+                      Ecosystem Interoperability Verified (1:1 mm)
+                    </span>
+                    <span className="text-[10px] text-emerald-400">
+                      {interop.step.entity_count} STEP entities • {interop.stl.volume_mm3.toLocaleString()} mm³
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-3 gap-2 text-[11px]">
+                    <div className="px-2 py-1 rounded bg-black/40 border border-emerald-800/60 text-emerald-300">
+                      {interop.autocad_compatible ? '✓ AutoCAD Ready' : '✗ AutoCAD Issue'}
+                    </div>
+                    <div className="px-2 py-1 rounded bg-black/40 border border-emerald-800/60 text-emerald-300">
+                      {interop.fusion360_compatible ? '✓ Fusion 360 Ready' : '✗ Fusion Issue'}
+                    </div>
+                    <div className="px-2 py-1 rounded bg-black/40 border border-emerald-800/60 text-emerald-300">
+                      {interop.solidworks_compatible ? '✓ SolidWorks Ready' : '✗ SW Issue'}
+                    </div>
+                  </div>
+                </div>
+              )}
             </div>
           ) : (
             <div className="space-y-3">

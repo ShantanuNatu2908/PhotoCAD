@@ -1,10 +1,11 @@
-import React, { useRef, useState, useEffect } from 'react';
+import React, { useRef, useState, useEffect, useMemo } from 'react';
 import { Canvas, useFrame } from '@react-three/fiber';
+import type { ThreeEvent } from '@react-three/fiber';
 import { OrbitControls, Grid, Center, GizmoHelper, GizmoViewport } from '@react-three/drei';
 import * as THREE from 'three';
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
 import { PLYLoader } from 'three/examples/jsm/loaders/PLYLoader.js';
-import { Play, Pause, Eye, Grid as GridIcon, Shield, Box, Sparkles } from 'lucide-react';
+import { Play, Pause, Eye, Grid as GridIcon, Shield, Box, Sparkles, Ruler, RotateCcw, X } from 'lucide-react';
 import type { Open3DGeometryReport } from '../types/cad';
 
 interface CadViewportProps {
@@ -16,15 +17,17 @@ interface CadViewportProps {
 }
 
 type RenderLayerMode = 'mesh' | 'cloud' | 'overlay';
+type Point3D = [number, number, number];
 
-// 3D Model Mesh Component (.STL / parametric box fallback)
 const ModelMesh: React.FC<{
   stlUrl?: string;
   wireframe: boolean;
   xray: boolean;
   rotating: boolean;
   dimensions?: { x: number; y: number; z: number };
-}> = ({ stlUrl, wireframe, xray, rotating, dimensions }) => {
+  measureMode: boolean;
+  onMeasurePick: (pt: Point3D) => void;
+}> = ({ stlUrl, wireframe, xray, rotating, dimensions, measureMode, onMeasurePick }) => {
   const meshRef = useRef<THREE.Mesh>(null);
   const [geometry, setGeometry] = useState<THREE.BufferGeometry | null>(null);
 
@@ -68,13 +71,19 @@ const ModelMesh: React.FC<{
 
   if (!geometry) return null;
 
+  const handleClick = (e: ThreeEvent<MouseEvent>) => {
+    if (!measureMode) return;
+    e.stopPropagation();
+    onMeasurePick([e.point.x, e.point.y, e.point.z]);
+  };
+
   return (
     <Center top>
-      {/* CAD STL exports use +Z up (same as Open3D PLY); BoxGeometry uses Three.js +Y up */}
       <mesh
         ref={meshRef}
         geometry={geometry}
         rotation={stlUrl ? [-Math.PI / 2, 0, 0] : [0, 0, 0]}
+        onClick={handleClick}
         castShadow
         receiveShadow
       >
@@ -97,11 +106,12 @@ const ModelMesh: React.FC<{
   );
 };
 
-// 3D Fused Point Cloud Component (.PLY from Phase 3 Open3D)
 const PointCloudMesh: React.FC<{
   plyUrl: string;
   rotating: boolean;
-}> = ({ plyUrl, rotating }) => {
+  measureMode: boolean;
+  onMeasurePick: (pt: Point3D) => void;
+}> = ({ plyUrl, rotating, measureMode, onMeasurePick }) => {
   const pointsRef = useRef<THREE.Points>(null);
   const [geometry, setGeometry] = useState<THREE.BufferGeometry | null>(null);
 
@@ -130,10 +140,15 @@ const PointCloudMesh: React.FC<{
 
   const hasVertexColors = Boolean(geometry.getAttribute('color'));
 
+  const handleClick = (e: ThreeEvent<MouseEvent>) => {
+    if (!measureMode) return;
+    e.stopPropagation();
+    onMeasurePick([e.point.x, e.point.y, e.point.z]);
+  };
+
   return (
     <Center top>
-      {/* Rotate -90 deg around X to align CAD +Z-up scan coordinates with Three.js +Y-up stage */}
-      <points ref={pointsRef} geometry={geometry} rotation={[-Math.PI / 2, 0, 0]}>
+      <points ref={pointsRef} geometry={geometry} rotation={[-Math.PI / 2, 0, 0]} onClick={handleClick}>
         <pointsMaterial
           size={1.65}
           sizeAttenuation
@@ -144,6 +159,33 @@ const PointCloudMesh: React.FC<{
         />
       </points>
     </Center>
+  );
+};
+
+const MeasurementOverlay3D: React.FC<{ points: Point3D[] }> = ({ points }) => {
+  const lineGeometry = useMemo(() => {
+    if (points.length !== 2) return null;
+    const geo = new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(...points[0]),
+      new THREE.Vector3(...points[1]),
+    ]);
+    return geo;
+  }, [points]);
+
+  return (
+    <group>
+      {points.map((pt, idx) => (
+        <mesh key={idx} position={pt}>
+          <sphereGeometry args={[1.4, 16, 16]} />
+          <meshBasicMaterial color={idx === 0 ? '#34d399' : '#22d3ee'} />
+        </mesh>
+      ))}
+      {lineGeometry && (
+        <lineSegments geometry={lineGeometry}>
+          <lineBasicMaterial color="#fde047" linewidth={2} />
+        </lineSegments>
+      )}
+    </group>
   );
 };
 
@@ -159,8 +201,11 @@ export const CadViewport3D: React.FC<CadViewportProps> = ({
   const [rotating, setRotating] = useState(false);
   const [showGrid, setShowGrid] = useState(true);
   const [layerMode, setLayerMode] = useState<RenderLayerMode>('mesh');
+  const [measureMode, setMeasureMode] = useState(false);
+  const [measurePoints, setMeasurePoints] = useState<Point3D[]>([]);
 
-  // Auto-switch to point cloud view as soon as Phase 3 .PLY arrives before .STL is compiled
+  const controlsRef = useRef<{ reset: () => void } | null>(null);
+
   useEffect(() => {
     if (plyUrl && !stlUrl) {
       setLayerMode('cloud');
@@ -171,9 +216,23 @@ export const CadViewport3D: React.FC<CadViewportProps> = ({
     }
   }, [plyUrl, stlUrl]);
 
-  const dx = geometryReport?.bounding_box_mm[0] ?? dimensions?.x ?? 60;
-  const dy = geometryReport?.bounding_box_mm[1] ?? dimensions?.y ?? 40;
-  const dz = geometryReport?.bounding_box_mm[2] ?? dimensions?.z ?? 25;
+  const rawDx = geometryReport?.bounding_box_mm[0] ?? dimensions?.x ?? 60;
+  const rawDy = geometryReport?.bounding_box_mm[1] ?? dimensions?.y ?? 40;
+  const rawDz = geometryReport?.bounding_box_mm[2] ?? dimensions?.z ?? 25;
+
+  const scaleFactor = unit === 'inch' ? 1.0 / 25.4 : 1.0;
+  const decimals = unit === 'inch' ? 3 : 1;
+  const fmtDim = (mm: number) => (mm * scaleFactor).toFixed(decimals);
+
+  const handleMeasurePick = (pt: Point3D) => {
+    setMeasurePoints((prev) => (prev.length >= 2 ? [pt] : [...prev, pt]));
+  };
+
+  const measuredMm = useMemo(() => {
+    if (measurePoints.length !== 2) return null;
+    const [a, b] = measurePoints;
+    return Math.hypot(b[0] - a[0], b[1] - a[1], b[2] - a[2]);
+  }, [measurePoints]);
 
   const showMesh = layerMode === 'mesh' || layerMode === 'overlay';
   const showCloud = Boolean(plyUrl) && (layerMode === 'cloud' || layerMode === 'overlay');
@@ -189,7 +248,7 @@ export const CadViewport3D: React.FC<CadViewportProps> = ({
             <span className="text-slate-400">Envelope:</span>
           </div>
           <span className="text-white font-semibold">
-            {dx} × {dy} × {dz} {unit}
+            {fmtDim(rawDx)} × {fmtDim(rawDy)} × {fmtDim(rawDz)} {unit}
           </span>
           {geometryReport && (
             <span className="hidden sm:inline-block pl-2 border-l border-cad-border text-[11px] text-emerald-300">
@@ -235,6 +294,16 @@ export const CadViewport3D: React.FC<CadViewportProps> = ({
 
           <div className="flex items-center space-x-1 bg-cad-card/90 backdrop-blur border border-cad-border rounded-lg p-1 shadow-lg">
             <button
+              onClick={() => {
+                setMeasureMode(!measureMode);
+                if (measureMode) setMeasurePoints([]);
+              }}
+              title="3D Point-to-Point Tape Measure (Click A & B on model)"
+              className={`p-1.5 rounded transition ${measureMode ? 'bg-amber-500/25 text-amber-300 ring-1 ring-amber-400' : 'text-slate-400 hover:text-white'}`}
+            >
+              <Ruler className="w-4 h-4" />
+            </button>
+            <button
               onClick={() => setRotating(!rotating)}
               title={rotating ? 'Pause Turntable' : 'Simulate Turntable Rotation'}
               className={`p-1.5 rounded transition ${rotating ? 'bg-cyan-500/20 text-cyan-400' : 'text-slate-400 hover:text-white'}`}
@@ -262,12 +331,45 @@ export const CadViewport3D: React.FC<CadViewportProps> = ({
             >
               <Shield className="w-4 h-4" />
             </button>
+            <button
+              onClick={() => controlsRef.current?.reset()}
+              title="Reset 3D Camera View"
+              className="p-1.5 rounded text-slate-400 hover:text-white transition"
+            >
+              <RotateCcw className="w-4 h-4" />
+            </button>
           </div>
         </div>
       </div>
 
+      {/* Floating 3D Measurement HUD */}
+      {measureMode && (
+        <div className="absolute top-14 left-3 z-10 pointer-events-auto bg-amber-950/90 backdrop-blur border border-amber-500/60 rounded-lg px-3 py-1.5 flex items-center space-x-3 text-xs font-mono text-amber-200 shadow-lg">
+          <Ruler className="w-3.5 h-3.5 text-amber-400" />
+          {measuredMm !== null ? (
+            <span>
+              Distance: <strong className="text-white">{(measuredMm * scaleFactor).toFixed(2)} {unit}</strong>
+              {unit === 'mm' ? ` (${(measuredMm / 25.4).toFixed(3)} in)` : ` (${measuredMm.toFixed(2)} mm)`}
+            </span>
+          ) : (
+            <span>
+              {measurePoints.length === 0 ? 'Click Point A on 3D surface' : 'Click Point B to measure'}
+            </span>
+          )}
+          {measurePoints.length > 0 && (
+            <button
+              onClick={() => setMeasurePoints([])}
+              title="Clear pins"
+              className="text-amber-300 hover:text-white"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          )}
+        </div>
+      )}
+
       {/* 3D Canvas */}
-      <div className="flex-1 w-full h-full cursor-grab active:cursor-grabbing">
+      <div className={`flex-1 w-full h-full ${measureMode ? 'cursor-crosshair' : 'cursor-grab active:cursor-grabbing'}`}>
         <Canvas shadows camera={{ position: [90, 80, 110], fov: 45 }}>
           <color attach="background" args={['#080b11']} />
 
@@ -296,15 +398,33 @@ export const CadViewport3D: React.FC<CadViewportProps> = ({
               wireframe={wireframe}
               xray={layerMode === 'overlay' ? true : xray}
               rotating={rotating}
-              dimensions={{ x: dx, y: dy, z: dz }}
+              dimensions={{ x: rawDx, y: rawDy, z: rawDz }}
+              measureMode={measureMode}
+              onMeasurePick={handleMeasurePick}
             />
           )}
 
           {showCloud && plyUrl && (
-            <PointCloudMesh plyUrl={plyUrl} rotating={rotating} />
+            <PointCloudMesh
+              plyUrl={plyUrl}
+              rotating={rotating}
+              measureMode={measureMode}
+              onMeasurePick={handleMeasurePick}
+            />
           )}
 
-          <OrbitControls makeDefault minDistance={20} maxDistance={400} enableDamping dampingFactor={0.05} />
+          {measurePoints.length > 0 && <MeasurementOverlay3D points={measurePoints} />}
+
+          <OrbitControls
+            ref={(ctrl) => {
+              controlsRef.current = ctrl;
+            }}
+            makeDefault
+            minDistance={20}
+            maxDistance={400}
+            enableDamping
+            dampingFactor={0.05}
+          />
 
           <GizmoHelper alignment="bottom-right" margin={[70, 70]}>
             <GizmoViewport axisColors={['#ff3366', '#33cc66', '#3399ff']} labelColor="#ffffff" />
