@@ -20,6 +20,7 @@ import os
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.graph import END, START, StateGraph
 
 from app.agents.nodes.analyst import geometry_analyst_node
@@ -33,8 +34,19 @@ from app.schemas.adt import Open3DGeometryReport
 
 WsStreamCallback = Optional[Callable[[Dict[str, Any]], Awaitable[None]]]
 
-# Shared in-memory checkpointer for local/Zero-Heat dev & thread-based /refine resumption
-_MEMORY_CHECKPOINTER = MemorySaver()
+ALLOWED_ADT_MODULES = [
+    ("app.schemas.adt", "Open3DGeometryReport"),
+    ("app.schemas.adt", "CSGFeatureTree"),
+    ("app.schemas.adt", "ValidationMetrics"),
+    ("app.schemas.adt", "FeatureStep"),
+    ("app.schemas.adt", "DetectedPlane"),
+    ("app.schemas.adt", "DetectedCylinder"),
+]
+
+# Shared in-memory checkpointer with strict Pydantic ADT allowlist
+_MEMORY_CHECKPOINTER = MemorySaver(
+    serde=JsonPlusSerializer(allowed_msgpack_modules=ALLOWED_ADT_MODULES)
+)
 
 
 def _entry_router(state: PhotoCADGraphState) -> str:

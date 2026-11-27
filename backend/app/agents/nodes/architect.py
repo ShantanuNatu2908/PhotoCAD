@@ -38,7 +38,7 @@ def _extract_clause_target_mm(clause: str, keywords_pattern: str) -> Optional[fl
 def _apply_refine_instruction(params: Dict[str, float], instruction: str) -> Dict[str, float]:
     """Deterministically interprets common multi-clause mechanical edit instructions in millimeters."""
     updated = dict(params)
-    clauses = re.split(r"(?:[,;.]|\band\b)", instruction.lower())
+    clauses = re.split(r"(?:[,;]|\.(?!\d)|\band\b)", instruction.lower())
 
     for clause in clauses:
         if not clause.strip():
