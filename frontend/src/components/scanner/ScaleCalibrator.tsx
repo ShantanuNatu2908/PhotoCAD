@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef } from 'react';
 import type { MouseEvent } from 'react';
 import { Ruler, Check, X, Crosshair, CreditCard, Compass } from 'lucide-react';
 import type { CalibrationSpec, AxisView } from '../../types/cad';
@@ -23,27 +23,34 @@ export const ScaleCalibrator: React.FC<ScaleCalibratorProps> = ({
   const [pointA, setPointA] = useState<[number, number] | null>(null);
   const [pointB, setPointB] = useState<[number, number] | null>(null);
   const [activePoint, setActivePoint] = useState<'A' | 'B'>('A');
+  const [imgDims, setImgDims] = useState<[number, number] | null>(null);
 
   const imgRef = useRef<HTMLImageElement>(null);
-  const containerRef = useRef<HTMLDivElement>(null);
 
-  // Switch presets when changing mode
-  useEffect(() => {
-    if (mode === 'id1_card') {
-      setKnownLengthMm(85.6); // ISO/IEC 7810 ID-1 standard width
-    } else if (mode === 'aruco_token') {
-      setKnownLengthMm(20.0); // Standard 20mm ArUco marker
+  const handleModeSelect = (nextMode: 'known_dimension' | 'id1_card' | 'aruco_token') => {
+    setMode(nextMode);
+    if (nextMode === 'id1_card') {
+      setKnownLengthMm(85.6);
+    } else if (nextMode === 'aruco_token') {
+      setKnownLengthMm(20.0);
     }
-  }, [mode]);
+  };
 
-  // Handle clicking on image to set Point A and Point B
+  const handleImageLoad = () => {
+    if (imgRef.current && imgRef.current.naturalWidth > 0) {
+      setImgDims([imgRef.current.naturalWidth, imgRef.current.naturalHeight]);
+    }
+  };
+
   const handleImageClick = (e: MouseEvent<HTMLDivElement>) => {
     if (!imgRef.current) return;
     const rect = imgRef.current.getBoundingClientRect();
+    const natW = imgRef.current.naturalWidth || rect.width;
+    const natH = imgRef.current.naturalHeight || rect.height;
+    setImgDims([natW, natH]);
 
-    // Normalized to original image resolution coordinates
-    const scaleX = imgRef.current.naturalWidth / rect.width;
-    const scaleY = imgRef.current.naturalHeight / rect.height;
+    const scaleX = natW / rect.width;
+    const scaleY = natH / rect.height;
 
     const clickX = (e.clientX - rect.left) * scaleX;
     const clickY = (e.clientY - rect.top) * scaleY;
@@ -57,12 +64,10 @@ export const ScaleCalibrator: React.FC<ScaleCalibratorProps> = ({
     }
   };
 
-  // Compute pixel distance between A and B
   const pixelDistance = pointA && pointB
     ? Math.hypot(pointB[0] - pointA[0], pointB[1] - pointA[1])
     : null;
 
-  // Compute scale: mm per pixel
   const mmPerPixel = pixelDistance && pixelDistance > 0 && knownLengthMm > 0
     ? knownLengthMm / pixelDistance
     : null;
@@ -104,7 +109,7 @@ export const ScaleCalibrator: React.FC<ScaleCalibratorProps> = ({
         {/* Mode Selector Tabs */}
         <div className="flex border-b border-cad-border bg-cad-dark/50 px-5 pt-2 gap-2">
           <button
-            onClick={() => setMode('known_dimension')}
+            onClick={() => handleModeSelect('known_dimension')}
             className={`pb-2.5 px-3 text-xs font-mono font-medium border-b-2 transition flex items-center space-x-1.5 ${
               mode === 'known_dimension'
                 ? 'border-cyan-400 text-cyan-400'
@@ -115,7 +120,7 @@ export const ScaleCalibrator: React.FC<ScaleCalibratorProps> = ({
             <span>2-Point Caliper Measurement</span>
           </button>
           <button
-            onClick={() => setMode('id1_card')}
+            onClick={() => handleModeSelect('id1_card')}
             className={`pb-2.5 px-3 text-xs font-mono font-medium border-b-2 transition flex items-center space-x-1.5 ${
               mode === 'id1_card'
                 ? 'border-cyan-400 text-cyan-400'
@@ -126,7 +131,7 @@ export const ScaleCalibrator: React.FC<ScaleCalibratorProps> = ({
             <span>ID-1 Reference Card (85.6mm)</span>
           </button>
           <button
-            onClick={() => setMode('aruco_token')}
+            onClick={() => handleModeSelect('aruco_token')}
             className={`pb-2.5 px-3 text-xs font-mono font-medium border-b-2 transition flex items-center space-x-1.5 ${
               mode === 'aruco_token'
                 ? 'border-cyan-400 text-cyan-400'
@@ -140,7 +145,6 @@ export const ScaleCalibrator: React.FC<ScaleCalibratorProps> = ({
 
         {/* Content Body */}
         <div className="p-5 overflow-y-auto space-y-4 flex-1">
-          {/* Instructions banner */}
           <div className="bg-cyan-950/40 border border-cyan-800/60 rounded-lg p-3 text-xs font-mono text-cyan-200 flex items-start justify-between">
             <div>
               <p className="font-semibold mb-1">
@@ -162,37 +166,35 @@ export const ScaleCalibrator: React.FC<ScaleCalibratorProps> = ({
 
           {/* Interactive Image Canvas */}
           <div
-            ref={containerRef}
             onClick={handleImageClick}
             className="relative bg-black rounded-lg border border-cad-border overflow-hidden cursor-crosshair flex items-center justify-center min-h-[300px]"
           >
             <img
               ref={imgRef}
+              onLoad={handleImageLoad}
               src={primaryViewUrl}
               alt="Calibration Reference"
               className="max-h-[380px] w-auto object-contain select-none pointer-events-auto"
             />
 
-            {/* Point A Marker */}
-            {pointA && imgRef.current && (
+            {pointA && imgDims && (
               <div
                 className="absolute w-4 h-4 -ml-2 -mt-2 rounded-full border-2 border-emerald-400 bg-emerald-400/40 flex items-center justify-center pointer-events-none text-[9px] font-bold text-black"
                 style={{
-                  left: `${(pointA[0] / imgRef.current.naturalWidth) * 100}%`,
-                  top: `${(pointA[1] / imgRef.current.naturalHeight) * 100}%`
+                  left: `${(pointA[0] / imgDims[0]) * 100}%`,
+                  top: `${(pointA[1] / imgDims[1]) * 100}%`
                 }}
               >
                 A
               </div>
             )}
 
-            {/* Point B Marker */}
-            {pointB && imgRef.current && (
+            {pointB && imgDims && (
               <div
                 className="absolute w-4 h-4 -ml-2 -mt-2 rounded-full border-2 border-cyan-400 bg-cyan-400/40 flex items-center justify-center pointer-events-none text-[9px] font-bold text-black"
                 style={{
-                  left: `${(pointB[0] / imgRef.current.naturalWidth) * 100}%`,
-                  top: `${(pointB[1] / imgRef.current.naturalHeight) * 100}%`
+                  left: `${(pointB[0] / imgDims[0]) * 100}%`,
+                  top: `${(pointB[1] / imgDims[1]) * 100}%`
                 }}
               >
                 B

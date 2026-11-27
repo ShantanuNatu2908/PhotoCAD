@@ -1,9 +1,11 @@
 import type {
+  AgentLog,
   AxisView,
   CalibrationSpec,
   KeyframeCapture,
   ScanFusionResponse,
   ScanWsEvent,
+  ValidationMetrics,
 } from '../types/cad';
 
 export const BACKEND_ORIGIN = 'http://localhost:8000';
@@ -194,6 +196,24 @@ export interface ScanGenerateApiResponse {
     dxf_url?: string;
     py_url?: string;
   };
+  validation_metrics?: ValidationMetrics | null;
+  agent_logs?: AgentLog[];
+}
+
+export async function uploadSingleViewKeyframe(
+  projectId: string,
+  existingScanId: string | null,
+  side: AxisView,
+  capture: KeyframeCapture
+): Promise<string> {
+  let scanId = existingScanId;
+  if (!scanId || scanId.startsWith('demo-')) {
+    const session = await createScanSession(projectId);
+    scanId = session.scan_id;
+  }
+  await uploadKeyframeBinary(`${API_BASE}/scans/${scanId}/views/${side}/upload`, capture.blob);
+  await confirmKeyframeView(scanId, side, capture);
+  return scanId;
 }
 
 export async function generateCadForScan(scanId: string): Promise<ScanGenerateApiResponse> {

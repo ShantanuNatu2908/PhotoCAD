@@ -109,3 +109,58 @@ export function evaluateSharpness(
     label: `Slight Blur (${variance.toFixed(1)})`
   };
 }
+
+/**
+ * Decodes any user-uploaded image (JPEG, PNG, WebP), computes true Laplacian sharpness
+ * variance, and normalizes it into an uncompressed PNG Blob per FR-04.
+ */
+export async function analyzeAndConvertImageToPng(file: File): Promise<{
+  blob: Blob;
+  dataUrl: string;
+  blurScore: number;
+  width: number;
+  height: number;
+}> {
+  const objectUrl = URL.createObjectURL(file);
+  try {
+    const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const el = new Image();
+      el.onload = () => resolve(el);
+      el.onerror = () => reject(new Error(`Could not decode image: ${file.name}`));
+      el.src = objectUrl;
+    });
+
+    const width = img.naturalWidth || 1280;
+    const height = img.naturalHeight || 720;
+
+    // 1. Evaluate sharpness at normalized 320x240 scale
+    const evalCanvas = document.createElement('canvas');
+    evalCanvas.width = 320;
+    evalCanvas.height = 240;
+    const evalCtx = evalCanvas.getContext('2d');
+    let blurScore = 150.0;
+    if (evalCtx) {
+      evalCtx.drawImage(img, 0, 0, 320, 240);
+      const imgData = evalCtx.getImageData(0, 0, 320, 240);
+      blurScore = computeLaplacianVariance(imgData);
+    }
+
+    // 2. Encode uncompressed PNG keyframe at native resolution
+    const fullCanvas = document.createElement('canvas');
+    fullCanvas.width = width;
+    fullCanvas.height = height;
+    const fullCtx = fullCanvas.getContext('2d');
+    if (fullCtx) {
+      fullCtx.drawImage(img, 0, 0, width, height);
+    }
+
+    const pngBlob = await new Promise<Blob>((resolve) => {
+      fullCanvas.toBlob((b) => resolve(b || file), 'image/png');
+    });
+    const pngDataUrl = URL.createObjectURL(pngBlob);
+
+    return { blob: pngBlob, dataUrl: pngDataUrl, blurScore, width, height };
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
+}

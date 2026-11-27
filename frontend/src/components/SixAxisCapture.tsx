@@ -46,7 +46,7 @@ export const SixAxisCapture: React.FC<SixAxisCaptureProps> = ({
             <span>6-Axis Orthographic Scanning Chamber</span>
           </h2>
           <p className="text-xs text-slate-400">
-            Orthogonal photos with real-time OpenCV contour & edge segmentation
+            Orthogonal PNG keyframes for SAM 2.1 silhouette masking & Open3D fusion
           </p>
         </div>
 
@@ -81,7 +81,7 @@ export const SixAxisCapture: React.FC<SixAxisCaptureProps> = ({
           const viewInfo = viewsData[key];
           const hasImage = !!viewInfo?.image_url;
           const displayUrl = showEdges
-            ? (viewInfo?.masked_url || viewInfo?.edge_url || viewInfo?.image_url)
+            ? (viewInfo?.masked_url || viewInfo?.image_url)
             : viewInfo?.image_url;
 
           return (
