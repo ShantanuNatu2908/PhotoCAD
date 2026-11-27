@@ -249,3 +249,26 @@ def run_full_cv_pipeline(
             "total_elapsed_ms": total_ms,
         },
     }
+
+
+cad_image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .apt_install("libgl1", "libglib2.0-0", "libgomp1", "libxrender1")
+    .pip_install("build123d>=0.8.0", "numpy>=1.26.0")
+    .add_local_python_source("gpu_workers")
+)
+
+
+@app.function(
+    image=cad_image,
+    cpu=2.0,
+    memory=2048,
+    scaledown_window=60,
+    timeout=45,
+    block_network=True,
+)
+def run_build123d_sandbox(code: str) -> Dict[str, Any]:
+    """Isolated Modal gVisor OpenCascade sandbox (`network blocked`, 2 vCPU, 2 GB RAM, 30s execution cap)."""
+    from gpu_workers.cad_sandbox import run_build123d_in_subprocess
+
+    return run_build123d_in_subprocess(code=code, timeout_sec=30)
