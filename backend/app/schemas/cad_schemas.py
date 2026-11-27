@@ -36,8 +36,12 @@ class ViewDetail(BaseModel):
 class ScanSessionResponse(BaseModel):
     id: str
     project_id: str
+    status: Optional[str] = "capturing"
     has_scale_reference: int
     scale_px_to_mm: float
+    calibration_json: Optional[Dict[str, Any]] = None
+    geometry_report_json: Optional[Dict[str, Any]] = None
+    ply_file: Optional[str] = None
     views_data: Dict[str, Any]
     created_at: datetime
 

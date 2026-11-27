@@ -26,11 +26,14 @@ class ScanSession(Base):
 
     id = Column(String(36), primary_key=True, default=generate_uuid)
     project_id = Column(String(36), ForeignKey("projects.id"), nullable=False)
+    status = Column(String(32), default="capturing")  # capturing, calibrated, processing_cv, fused, failed
     has_scale_reference = Column(Integer, default=0) # 1 if ArUco or calibrated marker present
     scale_px_to_mm = Column(Float, default=1.0)
+    calibration_json = Column(JSON, nullable=True)
+    geometry_report_json = Column(JSON, nullable=True)
+    ply_file = Column(String(256), nullable=True)
     
-    # Store paths and contour summary for all 6 orthogonal views
-    # e.g., {"front": {"image": "...", "edges": "...", "contours": [...]}, "top": ...}
+    # Store paths, masks, blur scores, and summary for all 6 orthogonal views
     views_data = Column(JSON, default=dict)
     
     created_at = Column(DateTime, default=datetime.utcnow)

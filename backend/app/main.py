@@ -65,11 +65,23 @@ app.add_middleware(
 # Mount storage directory for static access (uploaded images, edge maps, STL files)
 app.mount("/storage", StaticFiles(directory=str(settings.STORAGE_DIR)), name="storage")
 
-# Include API Routers
+# Include API Routers (primary /api plus /api/v1 alias per PCAD-API-ADT-003)
 app.include_router(projects_router, prefix=settings.API_V1_PREFIX)
 app.include_router(scans_router, prefix=settings.API_V1_PREFIX)
 app.include_router(generate_router, prefix=settings.API_V1_PREFIX)
 app.include_router(export_router, prefix=settings.API_V1_PREFIX)
+
+if settings.API_V1_PREFIX != "/api/v1":
+    app.include_router(projects_router, prefix="/api/v1", include_in_schema=False)
+    app.include_router(scans_router, prefix="/api/v1", include_in_schema=False)
+    app.include_router(generate_router, prefix="/api/v1", include_in_schema=False)
+    app.include_router(export_router, prefix="/api/v1", include_in_schema=False)
+
+
+async def broadcast_scan_event(scan_id: str, message: dict) -> None:
+    """Broadcasts PCAD-API-ADT-003 WebSocket progress events for a scan session."""
+    await ws_manager.broadcast_to_generation(f"scan:{scan_id}", message)
+
 
 @app.websocket("/ws/agent-logs/{generation_id}")
 async def websocket_agent_logs(websocket: WebSocket, generation_id: str):
@@ -80,6 +92,18 @@ async def websocket_agent_logs(websocket: WebSocket, generation_id: str):
             await websocket.receive_text()
     except WebSocketDisconnect:
         ws_manager.disconnect(generation_id, websocket)
+
+
+@app.websocket("/ws/v1/scans/{scan_id}")
+async def websocket_scan_events(websocket: WebSocket, scan_id: str):
+    """Real-time CV segmentation, fusion, and CAD synthesis event stream (PCAD-API-ADT-003)."""
+    channel_key = f"scan:{scan_id}"
+    await ws_manager.connect(channel_key, websocket)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        ws_manager.disconnect(channel_key, websocket)
 
 @app.get("/health")
 async def health_check():
