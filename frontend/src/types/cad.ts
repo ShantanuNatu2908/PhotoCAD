@@ -1,5 +1,24 @@
 export type AxisView = 'front' | 'back' | 'left' | 'right' | 'top' | 'bottom';
 
+export interface CalibrationSpec {
+  mode: 'aruco_token' | 'id1_card' | 'known_dimension';
+  reference_side: AxisView;
+  known_length_mm: number;
+  point_a_px?: [number, number];
+  point_b_px?: [number, number];
+  mm_per_unit?: number;
+}
+
+export interface KeyframeCapture {
+  side: AxisView;
+  blob: Blob;
+  dataUrl: string;
+  blurScore: number;
+  width: number;
+  height: number;
+  timestamp: string;
+}
+
 export interface ViewDetail {
   view: AxisView;
   image_url: string;
