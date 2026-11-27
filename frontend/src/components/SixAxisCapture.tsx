@@ -60,17 +60,17 @@ export const SixAxisCapture: React.FC<SixAxisCaptureProps> = ({
             <span>Load Demo Bracket Scan</span>
           </button>
 
-          {/* Edge view toggle */}
+          {/* Masked / Edge view toggle */}
           <button
             onClick={() => setShowEdges(!showEdges)}
             className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-lg border text-xs font-mono transition ${
               showEdges
-                ? 'bg-amber-950/80 text-amber-300 border-amber-700'
+                ? 'bg-emerald-950/80 text-emerald-300 border-emerald-700'
                 : 'bg-cad-dark text-slate-300 border-cad-border hover:border-slate-600'
             }`}
           >
             <SlidersHorizontal className="w-3.5 h-3.5" />
-            <span>{showEdges ? 'Showing Edges' : 'Show OpenCV Edges'}</span>
+            <span>{showEdges ? 'Showing SAM Masks' : 'Show SAM Masks'}</span>
           </button>
         </div>
       </div>
@@ -80,7 +80,9 @@ export const SixAxisCapture: React.FC<SixAxisCaptureProps> = ({
         {AXIS_CONFIG.map(({ key, label, axis }) => {
           const viewInfo = viewsData[key];
           const hasImage = !!viewInfo?.image_url;
-          const displayUrl = showEdges && viewInfo?.edge_url ? viewInfo.edge_url : viewInfo?.image_url;
+          const displayUrl = showEdges
+            ? (viewInfo?.masked_url || viewInfo?.edge_url || viewInfo?.image_url)
+            : viewInfo?.image_url;
 
           return (
             <div

@@ -451,6 +451,9 @@ export const ScannerChamber: React.FC<ScannerChamberProps> = ({
           onSaveCalibration={(spec) => {
             setCalibrationSpec(spec);
             setShowCalibrator(false);
+            if (Object.keys(captures).length === 6) {
+              onAllKeyframesCaptured(captures as Record<AxisView, KeyframeCapture>, spec);
+            }
           }}
           onCancel={() => setShowCalibrator(false)}
         />
