@@ -19,10 +19,15 @@ import type {
 import {
   API_BASE,
   uploadAndRunCvFusion,
+  uploadSingleViewKeyframe,
+  generateCadForScan,
   resolveBackendAssetUrl,
   subscribeScanEvents,
   refineCadRevision,
 } from './services/scanApi';
+import type { ScanGenerateApiResponse } from './services/scanApi';
+import { analyzeAndConvertImageToPng } from './utils/blurDetector';
+import { applyClientDemoRefine } from './utils/cadExport';
 import { Play, Download, Sparkles, RefreshCw, Camera, Grid, Layers, CheckCircle2, Wand2 } from 'lucide-react';
 
 async function generateDemoPngBatch(): Promise<Record<AxisView, KeyframeCapture>> {
@@ -127,14 +132,17 @@ export const App: React.FC = () => {
   }, []);
 
   // Poll generation status and agent logs if generation is active
+  const activeGenId = generation?.id;
+  const activeGenStatus = generation?.status;
+
   useEffect(() => {
-    if (!generation || (generation.status !== 'generating' && generation.status !== 'compiling' && generation.status !== 'pending')) {
+    if (!activeGenId || (activeGenStatus !== 'generating' && activeGenStatus !== 'compiling' && activeGenStatus !== 'pending')) {
       return;
     }
 
     const interval = setInterval(async () => {
       try {
-        const res = await fetch(`${API_BASE}/generate/${generation.id}`);
+        const res = await fetch(`${API_BASE}/generate/${activeGenId}`);
         if (res.ok) {
           const updated: CadGeneration = await res.json();
           setGeneration(updated);
@@ -164,7 +172,7 @@ export const App: React.FC = () => {
     }, 1200);
 
     return () => clearInterval(interval);
-  }, [generation?.id, generation?.status]);
+  }, [activeGenId, activeGenStatus]);
 
   const appendLog = (agentName: string, logType: AgentLog['log_type'], message: string) => {
     setAgentLogs((prev) => [
@@ -214,25 +222,42 @@ export const App: React.FC = () => {
     appendLog('ScannerChamber', 'info', 'Loaded 6-axis demo keyframe set with 80.0mm calibration reference.');
   };
 
-  // Upload view photo to backend
+  // Upload photo from Grid tab using Phase 2/3 PNG normalization & binary view upload
   const handleUploadView = async (view: AxisView, file: File) => {
-    const formData = new FormData();
-    formData.append('project_id', projectId);
-    formData.append('has_scale_reference', String(hasScaleRef));
-    formData.append(view, file);
-
     try {
-      const res = await fetch(`${API_BASE}/scans/upload-6-axis`, {
-        method: 'POST',
-        body: formData,
-      });
-      if (res.ok) {
-        const session = await res.json();
-        setScanSessionId(session.id);
-        setViewsData((prev) => ({ ...prev, ...session.views_data }));
-      }
+      const analyzed = await analyzeAndConvertImageToPng(file);
+      const capture: KeyframeCapture = {
+        side: view,
+        blob: analyzed.blob,
+        dataUrl: analyzed.dataUrl,
+        blurScore: analyzed.blurScore,
+        width: analyzed.width,
+        height: analyzed.height,
+        timestamp: new Date().toISOString(),
+      };
+
+      setCapturedKeyframes((prev) => ({
+        ...(prev || ({} as Record<AxisView, KeyframeCapture>)),
+        [view]: capture,
+      }));
+      setViewsData((prev) => ({
+        ...prev,
+        [view]: {
+          view,
+          image_url: capture.dataUrl,
+          blur_score: capture.blurScore,
+          original_resolution: [capture.width, capture.height],
+          features_detected: 4,
+          primary_dimensions_mm: [80.0, 50.0],
+          features: [],
+        },
+      }));
+
+      const activeId = await uploadSingleViewKeyframe(projectId, scanSessionId, view, capture);
+      setScanSessionId(activeId);
+      appendLog('UploadClient', 'info', `Uploaded ${view.toUpperCase()} PNG (${capture.width}×${capture.height}, sharpness ${capture.blurScore.toFixed(0)}).`);
     } catch (e) {
-      console.error('Upload failed', e);
+      appendLog('UploadClient', 'error', e instanceof Error ? e.message : 'Photo upload failed');
     }
   };
 
@@ -364,8 +389,29 @@ export const App: React.FC = () => {
     }
   };
 
+  const applyScanGenerationResult = (res: ScanGenerateApiResponse) => {
+    setGeneration({
+      id: res.generation_id,
+      scan_session_id: res.scan_id,
+      version: res.revision,
+      status: res.status as CadGeneration['status'],
+      code: res.code,
+      step_file: res.artifacts.step_url,
+      stl_file: res.artifacts.stl_url,
+      dxf_file: res.artifacts.dxf_url,
+      dimensions_mm: res.dimensions_mm,
+      created_at: new Date().toISOString(),
+    });
+    if (res.validation_metrics) {
+      setValidationMetrics(res.validation_metrics);
+    }
+    if (res.agent_logs && res.agent_logs.length > 0) {
+      setAgentLogs(res.agent_logs);
+    }
+  };
+
   // Trigger Multi-Agent LangGraph CAD Synthesis
-  const handleSynthesizeCAD = async () => {
+  const handleSynthesizeCAD = async (): Promise<CadGeneration | null> => {
     setIsGenerating(true);
     setSystemStatus('LangGraph Dual-Loop...');
 
@@ -392,60 +438,116 @@ export const App: React.FC = () => {
 
       unsubscribeWs = subscribeScanEvents(targetScanId, handleScanWsEvent);
 
-      const res = await fetch(`${API_BASE}/generate/trigger`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          scan_session_id: targetScanId,
-          target_engine: 'build123d',
-        }),
-      });
-
-      if (res.ok) {
-        const gen: CadGeneration = await res.json();
-        setGeneration(gen);
-      } else {
-        throw new Error(`HTTP ${res.status}`);
-      }
+      const genRes = await generateCadForScan(targetScanId);
+      applyScanGenerationResult(genRes);
+      setSystemStatus(`Rev v${genRes.revision} Verified`);
+      return {
+        id: genRes.generation_id,
+        scan_session_id: genRes.scan_id,
+        version: genRes.revision,
+        status: genRes.status as CadGeneration['status'],
+        code: genRes.code,
+        step_file: genRes.artifacts.step_url,
+        stl_file: genRes.artifacts.stl_url,
+        dxf_file: genRes.artifacts.dxf_url,
+        dimensions_mm: genRes.dimensions_mm,
+        created_at: new Date().toISOString(),
+      };
     } catch (e) {
       console.warn('Fallback local agent simulation loop active', e);
       simulateAgentLoop();
+      return null;
     } finally {
-      setTimeout(unsubscribeWs, 12000);
+      setIsGenerating(false);
+      setActiveLangGraphNode(null);
+      setTimeout(unsubscribeWs, 1200);
     }
   };
 
-  // Phase 4 Checkpointed Conversational /refine Edit
-  const handleRefineCAD = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!scanSessionId || scanSessionId.startsWith('demo-') || !refinePrompt.trim()) return;
+  // Phase 4 Checkpointed Conversational /refine Edit (auto-synthesizes Rev 1 first if needed)
+  const executeRefineInstruction = async (rawInstruction: string) => {
+    const instruction = rawInstruction.trim();
+    if (!instruction) return;
+
     setIsRefining(true);
     setSystemStatus('Refining Checkpoint...');
-    const unsub = subscribeScanEvents(scanSessionId, handleScanWsEvent);
-    appendLog('CSGArchitect', 'thought', `Resuming LangGraph checkpoint for edit: "${refinePrompt}"`);
+    appendLog('CSGArchitect', 'thought', `Applying parametric edit: "${instruction}"`);
+
+    let activeScanId = scanSessionId;
+    let currentGen = generation;
+    let unsub = () => {};
 
     try {
-      const updated = await refineCadRevision(scanSessionId, refinePrompt.trim(), generation?.version || 1);
-      setGeneration({
-        id: updated.generation_id,
-        scan_session_id: updated.scan_id,
-        version: updated.revision,
-        status: updated.status as CadGeneration['status'],
-        code: updated.code,
-        step_file: updated.artifacts.step_url,
-        stl_file: updated.artifacts.stl_url,
-        dxf_file: updated.artifacts.dxf_url,
-        dimensions_mm: updated.dimensions_mm,
+      if (!activeScanId || activeScanId.startsWith('demo-') || !currentGen || currentGen.id.startsWith('demo-')) {
+        const synthesized = await handleSynthesizeCAD();
+        if (synthesized) {
+          activeScanId = synthesized.scan_session_id;
+          currentGen = synthesized;
+        }
+      }
+
+      if (activeScanId && !activeScanId.startsWith('demo-')) {
+        unsub = subscribeScanEvents(activeScanId, handleScanWsEvent);
+        const updated = await refineCadRevision(activeScanId, instruction, currentGen?.version || 1);
+        applyScanGenerationResult(updated);
+        setRefinePrompt('');
+        setSystemStatus(`Rev v${updated.revision} Ready`);
+        appendLog('Validator', 'success', `Revision v${updated.revision} compiled (${updated.dimensions_mm?.x}×${updated.dimensions_mm?.y}×${updated.dimensions_mm?.z} mm).`);
+        return;
+      }
+
+      // Offline/Demo parametric fallback if FastAPI backend is unreachable
+      const baseGen: CadGeneration = currentGen || {
+        id: 'demo-gen-001',
+        scan_session_id: 'demo-session-882',
+        version: 1,
+        status: 'completed',
+        dimensions_mm: { x: 80, y: 50, z: 30 },
         created_at: new Date().toISOString(),
-      });
+      };
+      const { updated, summary } = applyClientDemoRefine(baseGen, instruction);
+      setGeneration(updated);
       setRefinePrompt('');
-      setSystemStatus(`Rev v${updated.revision} Ready`);
+      setSystemStatus(`Rev v${updated.version} (Demo)`);
+      appendLog('Validator', 'success', summary);
     } catch (err) {
       appendLog('Orchestrator', 'error', err instanceof Error ? err.message : 'Refine failed');
+      setSystemStatus('Refine Failed');
     } finally {
       setIsRefining(false);
       setActiveLangGraphNode(null);
       setTimeout(unsub, 500);
+    }
+  };
+
+  const handleRefineCAD = async (e: React.FormEvent) => {
+    e.preventDefault();
+    await executeRefineInstruction(refinePrompt);
+  };
+
+  const handleQuickExportClick = async () => {
+    if (generation) {
+      setShowExportModal(true);
+      return;
+    }
+    const generated = await handleSynthesizeCAD();
+    if (generated) {
+      setShowExportModal(true);
+    } else {
+      // Ensure immediate demo generation export opens cleanly even if backend is offline
+      setGeneration({
+        id: 'demo-gen-001',
+        scan_session_id: scanSessionId || 'demo-session-882',
+        version: 1,
+        status: 'completed',
+        dimensions_mm: {
+          x: geometryReport?.bounding_box_mm[0] ?? 80,
+          y: geometryReport?.bounding_box_mm[1] ?? 50,
+          z: geometryReport?.bounding_box_mm[2] ?? 30,
+        },
+        created_at: new Date().toISOString(),
+      });
+      setShowExportModal(true);
     }
   };
 
@@ -543,15 +645,14 @@ export const App: React.FC = () => {
               )}
             </button>
 
-            {(generation?.status === 'completed' || generation?.status === 'completed_with_warning') && (
-              <button
-                onClick={() => setShowExportModal(true)}
-                className="flex items-center space-x-2 px-4 py-2.5 rounded-lg bg-emerald-950 text-emerald-300 border border-emerald-700 hover:bg-emerald-900 transition font-mono text-xs font-semibold shadow-md"
-              >
-                <Download className="w-4 h-4" />
-                <span>EXPORT CAD PACKAGES</span>
-              </button>
-            )}
+            <button
+              onClick={handleQuickExportClick}
+              disabled={isGenerating}
+              className="flex items-center space-x-2 px-4 py-2.5 rounded-lg bg-emerald-950 text-emerald-300 border border-emerald-600/80 hover:bg-emerald-900 disabled:opacity-50 transition font-mono text-xs font-semibold shadow-md"
+            >
+              <Download className="w-4 h-4" />
+              <span>EXPORT AUTOCAD (.STEP / .DXF)</span>
+            </button>
           </div>
         </div>
 
@@ -654,42 +755,36 @@ export const App: React.FC = () => {
             )}
           </div>
 
-          {/* Right Column: 3D CAD Viewport & Multi-Agent Terminal (7 cols) */}
-          <div className="lg:col-span-7 flex flex-col space-y-4">
-            <div className="h-[430px] w-full">
+          {/* Right Column: 3D CAD Viewport, /refine Studio Bar & Multi-Agent Terminal (7 cols) */}
+          <div className="lg:col-span-7 flex flex-col space-y-3.5">
+            <div className="h-[365px] w-full">
               <CadViewport3D
                 stlUrl={generation?.stl_file ? `http://localhost:8000${generation.stl_file}` : undefined}
                 plyUrl={plyUrl}
                 geometryReport={geometryReport}
                 dimensions={generation?.dimensions_mm}
                 unit={unit}
+                onExportClick={handleQuickExportClick}
               />
             </div>
 
-            <div className="h-[280px] w-full">
-              <AgentTerminal
-                logs={agentLogs}
-                status={generation?.status || (isFusing || isGenerating || isRefining ? 'generating' : 'idle')}
-                activeNode={activeLangGraphNode}
-                validationMetrics={validationMetrics}
-              />
-            </div>
-
-            {(generation?.status === 'completed' || generation?.status === 'completed_with_warning') &&
-              scanSessionId &&
-              !scanSessionId.startsWith('demo-') && (
-              <form
-                onSubmit={handleRefineCAD}
-                className="flex items-center gap-2 bg-cad-card border border-cyan-800/60 p-2.5 rounded-xl shadow-md"
-              >
+            {/* Always-Visible Parametric /refine Bar + Quick Presets */}
+            <form
+              onSubmit={handleRefineCAD}
+              className="bg-cad-card border border-cyan-800/70 p-2.5 rounded-xl shadow-md space-y-2"
+            >
+              <div className="flex items-center gap-2">
                 <Wand2 className="w-4 h-4 text-cyan-400 shrink-0 ml-1" />
                 <input
                   type="text"
                   value={refinePrompt}
                   onChange={(e) => setRefinePrompt(e.target.value)}
-                  placeholder='Parametric /refine edit (e.g. "Change center hole diameter to 12 mm")'
+                  placeholder='Parametric /refine (e.g. "Change hole to 14 mm", "100x60x25", "Remove hole")'
                   className="flex-1 bg-transparent text-xs font-mono text-white placeholder-slate-500 focus:outline-none"
                 />
+                <span className="hidden sm:inline text-[10px] font-mono px-2 py-0.5 rounded bg-slate-900 border border-cad-border text-cyan-300">
+                  Rev v{generation?.version ?? 1}
+                </span>
                 <button
                   type="submit"
                   disabled={isRefining || !refinePrompt.trim()}
@@ -697,8 +792,36 @@ export const App: React.FC = () => {
                 >
                   {isRefining ? 'Refining...' : 'Apply /refine'}
                 </button>
-              </form>
-            )}
+              </div>
+              <div className="flex flex-wrap items-center gap-1.5 pl-1">
+                <span className="text-[10px] font-mono text-slate-500">Quick edits:</span>
+                {[
+                  { label: 'Hole 14mm', instr: 'Change hole diameter to 14 mm' },
+                  { label: '100×60×25 mm', instr: '100x60x25' },
+                  { label: 'Chamfer 2mm', instr: 'Add 2 mm chamfer' },
+                  { label: 'Remove Hole', instr: 'Remove center hole' },
+                ].map((preset) => (
+                  <button
+                    key={preset.label}
+                    type="button"
+                    disabled={isRefining}
+                    onClick={() => executeRefineInstruction(preset.instr)}
+                    className="px-2 py-0.5 rounded bg-slate-900/90 hover:bg-cyan-950 border border-cad-border hover:border-cyan-700 text-[10px] font-mono text-slate-300 hover:text-cyan-300 transition disabled:opacity-40"
+                  >
+                    {preset.label}
+                  </button>
+                ))}
+              </div>
+            </form>
+
+            <div className="h-[245px] w-full">
+              <AgentTerminal
+                logs={agentLogs}
+                status={generation?.status || (isFusing || isGenerating || isRefining ? 'generating' : 'idle')}
+                activeNode={activeLangGraphNode}
+                validationMetrics={validationMetrics}
+              />
+            </div>
           </div>
         </div>
       </main>

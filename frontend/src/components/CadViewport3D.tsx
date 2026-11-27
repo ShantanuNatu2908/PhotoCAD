@@ -5,7 +5,7 @@ import { OrbitControls, Grid, Center, GizmoHelper, GizmoViewport } from '@react-
 import * as THREE from 'three';
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
 import { PLYLoader } from 'three/examples/jsm/loaders/PLYLoader.js';
-import { Play, Pause, Eye, Grid as GridIcon, Shield, Box, Sparkles, Ruler, RotateCcw, X } from 'lucide-react';
+import { Play, Pause, Eye, Grid as GridIcon, Shield, Box, Sparkles, Ruler, RotateCcw, X, Download } from 'lucide-react';
 import type { Open3DGeometryReport } from '../types/cad';
 
 interface CadViewportProps {
@@ -14,6 +14,7 @@ interface CadViewportProps {
   geometryReport?: Open3DGeometryReport | null;
   dimensions?: { x: number; y: number; z: number };
   unit: string;
+  onExportClick?: () => void;
 }
 
 type RenderLayerMode = 'mesh' | 'cloud' | 'overlay';
@@ -29,39 +30,47 @@ const ModelMesh: React.FC<{
   onMeasurePick: (pt: Point3D) => void;
 }> = ({ stlUrl, wireframe, xray, rotating, dimensions, measureMode, onMeasurePick }) => {
   const meshRef = useRef<THREE.Mesh>(null);
-  const [geometry, setGeometry] = useState<THREE.BufferGeometry | null>(null);
+  const [loadedStl, setLoadedStl] = useState<{ url: string; geo: THREE.BufferGeometry } | null>(null);
+  const [failedStlUrl, setFailedStlUrl] = useState<string | null>(null);
+
+  const fallbackGeometry = useMemo(() => {
+    const dx = dimensions?.x || 60;
+    const dy = dimensions?.y || 40;
+    const dz = dimensions?.z || 25;
+    return new THREE.BoxGeometry(dx, dz, dy);
+  }, [dimensions?.x, dimensions?.y, dimensions?.z]);
 
   useEffect(() => {
-    if (!stlUrl) {
-      const dx = dimensions?.x || 60;
-      const dy = dimensions?.y || 40;
-      const dz = dimensions?.z || 25;
-      setGeometry(new THREE.BoxGeometry(dx, dz, dy));
-      return;
-    }
-
+    if (!stlUrl) return;
+    let cancelled = false;
     const loader = new STLLoader();
     loader.load(
       stlUrl,
       (geo) => {
+        if (cancelled) return;
         geo.computeVertexNormals();
         geo.center();
-        setGeometry(geo);
+        setLoadedStl({ url: stlUrl, geo });
+        setFailedStlUrl(null);
       },
       undefined,
       (err) => {
+        if (cancelled) return;
         console.warn('Could not load STL, using parametric fallback geometry', err);
-        const dx = dimensions?.x || 60;
-        const dy = dimensions?.y || 40;
-        const dz = dimensions?.z || 25;
-        setGeometry(new THREE.BoxGeometry(dx, dz, dy));
+        setFailedStlUrl(stlUrl);
       }
     );
-  }, [stlUrl, dimensions]);
+    return () => {
+      cancelled = true;
+    };
+  }, [stlUrl]);
+
+  const hasLoadedStl = Boolean(stlUrl && failedStlUrl !== stlUrl && loadedStl?.url === stlUrl);
+  const geometry = hasLoadedStl ? loadedStl!.geo : fallbackGeometry;
 
   useFrame((_, delta) => {
     if (rotating && meshRef.current) {
-      if (stlUrl) {
+      if (hasLoadedStl) {
         meshRef.current.rotation.z += delta * 0.5;
       } else {
         meshRef.current.rotation.y += delta * 0.5;
@@ -82,7 +91,7 @@ const ModelMesh: React.FC<{
       <mesh
         ref={meshRef}
         geometry={geometry}
-        rotation={stlUrl ? [-Math.PI / 2, 0, 0] : [0, 0, 0]}
+        rotation={hasLoadedStl ? [-Math.PI / 2, 0, 0] : [0, 0, 0]}
         onClick={handleClick}
         castShadow
         receiveShadow
@@ -195,26 +204,26 @@ export const CadViewport3D: React.FC<CadViewportProps> = ({
   geometryReport,
   dimensions,
   unit,
+  onExportClick,
 }) => {
   const [wireframe, setWireframe] = useState(false);
   const [xray, setXray] = useState(false);
   const [rotating, setRotating] = useState(false);
   const [showGrid, setShowGrid] = useState(true);
-  const [layerMode, setLayerMode] = useState<RenderLayerMode>('mesh');
+  const [userLayerMode, setUserLayerMode] = useState<RenderLayerMode | null>(null);
   const [measureMode, setMeasureMode] = useState(false);
   const [measurePoints, setMeasurePoints] = useState<Point3D[]>([]);
 
   const controlsRef = useRef<{ reset: () => void } | null>(null);
 
-  useEffect(() => {
-    if (plyUrl && !stlUrl) {
-      setLayerMode('cloud');
-    } else if (stlUrl && !plyUrl) {
-      setLayerMode('mesh');
-    } else if (stlUrl && plyUrl) {
-      setLayerMode('overlay');
-    }
-  }, [plyUrl, stlUrl]);
+  const defaultLayerMode: RenderLayerMode =
+    plyUrl && stlUrl ? 'overlay' : plyUrl ? 'cloud' : 'mesh';
+  const layerMode: RenderLayerMode = (() => {
+    if (!userLayerMode) return defaultLayerMode;
+    if (userLayerMode === 'overlay' && (!plyUrl || !stlUrl)) return defaultLayerMode;
+    if (userLayerMode === 'cloud' && !plyUrl) return defaultLayerMode;
+    return userLayerMode;
+  })();
 
   const rawDx = geometryReport?.bounding_box_mm[0] ?? dimensions?.x ?? 60;
   const rawDy = geometryReport?.bounding_box_mm[1] ?? dimensions?.y ?? 40;
@@ -238,7 +247,7 @@ export const CadViewport3D: React.FC<CadViewportProps> = ({
   const showCloud = Boolean(plyUrl) && (layerMode === 'cloud' || layerMode === 'overlay');
 
   return (
-    <div className="relative w-full h-full min-h-[420px] bg-[#0c1017] rounded-xl border border-cad-border overflow-hidden shadow-2xl flex flex-col">
+    <div className="relative w-full h-full min-h-[360px] bg-[#0c1017] rounded-xl border border-cad-border overflow-hidden shadow-2xl flex flex-col">
       {/* Top Controls Overlay */}
       <div className="absolute top-3 left-3 right-3 z-10 flex flex-wrap items-center justify-between gap-2 pointer-events-none">
         {/* Physical Dimension & Open3D Telemetry Badge */}
@@ -262,7 +271,7 @@ export const CadViewport3D: React.FC<CadViewportProps> = ({
           {plyUrl && (
             <div className="flex items-center bg-cad-card/90 backdrop-blur border border-cad-border rounded-lg p-1 text-[11px] font-mono shadow-lg">
               <button
-                onClick={() => setLayerMode('cloud')}
+                onClick={() => setUserLayerMode('cloud')}
                 className={`px-2 py-1 rounded flex items-center gap-1 transition ${
                   layerMode === 'cloud' ? 'bg-cyan-500/25 text-cyan-300 font-semibold' : 'text-slate-400 hover:text-white'
                 }`}
@@ -271,7 +280,7 @@ export const CadViewport3D: React.FC<CadViewportProps> = ({
                 <span>.PLY Cloud</span>
               </button>
               <button
-                onClick={() => setLayerMode('mesh')}
+                onClick={() => setUserLayerMode('mesh')}
                 className={`px-2 py-1 rounded flex items-center gap-1 transition ${
                   layerMode === 'mesh' ? 'bg-cyan-500/25 text-cyan-300 font-semibold' : 'text-slate-400 hover:text-white'
                 }`}
@@ -281,7 +290,7 @@ export const CadViewport3D: React.FC<CadViewportProps> = ({
               </button>
               {stlUrl && (
                 <button
-                  onClick={() => setLayerMode('overlay')}
+                  onClick={() => setUserLayerMode('overlay')}
                   className={`px-2 py-1 rounded transition ${
                     layerMode === 'overlay' ? 'bg-emerald-500/25 text-emerald-300 font-semibold' : 'text-slate-400 hover:text-white'
                   }`}
@@ -338,6 +347,16 @@ export const CadViewport3D: React.FC<CadViewportProps> = ({
             >
               <RotateCcw className="w-4 h-4" />
             </button>
+            {onExportClick && (
+              <button
+                onClick={onExportClick}
+                title="Export AutoCAD (.DXF), .STEP, .STL, or build123d .py"
+                className="flex items-center gap-1 px-2.5 py-1 rounded bg-emerald-950/90 hover:bg-emerald-900 border border-emerald-600/70 text-emerald-300 text-[11px] font-mono font-semibold transition"
+              >
+                <Download className="w-3.5 h-3.5" />
+                <span>Export CAD</span>
+              </button>
+            )}
           </div>
         </div>
       </div>
