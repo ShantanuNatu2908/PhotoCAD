@@ -16,7 +16,6 @@ from typing import Any, Dict, Optional
 
 import modal
 
-
 # 1. Define Modal App
 app = modal.App("photocad-gpu")
 
@@ -157,12 +156,13 @@ def run_full_cv_pipeline(
       Stage 3: Open3D Multi-View Registration (SOR -> RANSAC -> ICP -> Scale -> Primitives)
     """
     import io
+
     import numpy as np
     from PIL import Image
 
-    from gpu_workers.segmentation import Sam2SegmentationWorker
     from gpu_workers.depth_estimation import DepthEstimationWorker
     from gpu_workers.fusion_open3d import fuse_and_extract_open3d
+    from gpu_workers.segmentation import Sam2SegmentationWorker
 
     t0 = time.perf_counter()
 

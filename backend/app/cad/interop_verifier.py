@@ -13,12 +13,15 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import List, Set, Tuple
 
 import numpy as np
 from pydantic import BaseModel
 
-from app.cad.chamfer_validator import check_mesh_watertight_and_props, load_ascii_stl_triangles
+from app.cad.chamfer_validator import (
+    check_mesh_watertight_and_props,
+    load_ascii_stl_triangles,
+)
 
 
 class StepInteropResult(BaseModel):

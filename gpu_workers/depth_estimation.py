@@ -11,11 +11,10 @@ from __future__ import annotations
 import io
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Tuple
 
 import numpy as np
 from PIL import Image
-
 
 DEFAULT_DA3_MODEL_ID = "depth-anything/DA3-BASE"
 DEFAULT_DA2_MODEL_ID = "depth-anything/Depth-Anything-V2-Small-hf"

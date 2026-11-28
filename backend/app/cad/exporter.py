@@ -17,7 +17,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Tuple
 
-
 Triangle = Tuple[Tuple[float, float, float], Tuple[float, float, float], Tuple[float, float, float]]
 
 
@@ -391,6 +390,221 @@ def write_orthographic_dxf(
         "10", f"{-hx:.4f}", "20", f"{-hy - 12.0:.4f}", "30", "0.0",
         "40", "3.5",
         "1", f"PHOTOCAD 1:1 MM | {length_x:.2f} x {width_y:.2f} x {height_z:.2f} mm",
+    ])
+
+    dxf_lines = [
+        "0", "SECTION", "2", "HEADER",
+        "9", "$ACADVER", "1", "AC1009",
+        "9", "$INSUNITS", "70", "4",
+        "9", "$MEASUREMENT", "70", "1",
+        "0", "ENDSEC",
+        "0", "SECTION", "2", "TABLES",
+        "0", "TABLE", "2", "LAYER", "70", "2",
+        "0", "LAYER", "2", "GEOMETRY", "70", "0", "62", "7", "6", "CONTINUOUS",
+        "0", "LAYER", "2", "ANNOTATIONS", "70", "0", "62", "4", "6", "CONTINUOUS",
+        "0", "ENDTAB",
+        "0", "ENDSEC",
+        "0", "SECTION", "2", "ENTITIES",
+        *entities,
+        "0", "ENDSEC",
+        "0", "EOF\n",
+    ]
+    path = Path(output_dxf_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(dxf_lines), encoding="utf-8")
+    return path
+
+
+def write_mesh_stl(
+    output_stl_path: str | Path,
+    vertices_mm: List[List[float]],
+    triangles_idx: List[List[int]],
+) -> Path:
+    """Exports an arbitrary 2-manifold sculpted triangle mesh as ASCII .STL in 1:1 millimeters."""
+    lines = ["solid PhotoCAD_Sculpted_Solid"]
+    for i0, i1, i2 in triangles_idx:
+        v0 = (float(vertices_mm[i0][0]), float(vertices_mm[i0][1]), float(vertices_mm[i0][2]))
+        v1 = (float(vertices_mm[i1][0]), float(vertices_mm[i1][1]), float(vertices_mm[i1][2]))
+        v2 = (float(vertices_mm[i2][0]), float(vertices_mm[i2][1]), float(vertices_mm[i2][2]))
+        nx, ny, nz = _cross_normal(v0, v1, v2)
+        lines.append(f"  facet normal {nx:.6f} {ny:.6f} {nz:.6f}")
+        lines.append("    outer loop")
+        lines.append(f"      vertex {v0[0]:.5f} {v0[1]:.5f} {v0[2]:.5f}")
+        lines.append(f"      vertex {v1[0]:.5f} {v1[1]:.5f} {v1[2]:.5f}")
+        lines.append(f"      vertex {v2[0]:.5f} {v2[1]:.5f} {v2[2]:.5f}")
+        lines.append("    endloop")
+        lines.append("  endfacet")
+    lines.append("endsolid PhotoCAD_Sculpted_Solid\n")
+
+    path = Path(output_stl_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return path
+
+
+def write_faceted_hull_step(
+    output_step_path: str | Path,
+    vertices_mm: List[List[float]],
+    triangles_idx: List[List[int]],
+    length_x: float,
+    width_y: float,
+    height_z: float,
+) -> Path:
+    """
+    Writes a referentially complete ISO 10303-21 (AP214) CLOSED_SHELL B-Rep STEP file
+    across a sculpted triangle mesh (AutoCAD / Fusion 360 / SolidWorks importable, 1:1 mm).
+    """
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    eid = 1
+    entities: List[str] = []
+
+    def add(def_str: str) -> int:
+        nonlocal eid
+        idx = eid
+        entities.append(f"#{idx}={def_str};")
+        eid += 1
+        return idx
+
+    app_ctx = add("APPLICATION_CONTEXT('automotive design')")
+    add(f"APPLICATION_PROTOCOL_DEFINITION('ISO 10303-214','automotive_design',2001,#{app_ctx})")
+    pd_ctx = add(f"PRODUCT_DEFINITION_CONTEXT('part definition',#{app_ctx},'design')")
+    p_ctx = add(f"PRODUCT_CONTEXT('part context',#{app_ctx},'mechanical')")
+    prod = add(f"PRODUCT('PhotoCAD_Part','PhotoCAD_Part','Sculpted 1:1 mm Solid',(#{p_ctx}))")
+    pdf = add(f"PRODUCT_DEFINITION_FORMATION('1.0','Release',#{prod})")
+    pdef = add(f"PRODUCT_DEFINITION('design','PhotoCAD Sculpted Definition',#{pdf},#{pd_ctx})")
+    pds = add(f"PRODUCT_DEFINITION_SHAPE('','',#{pdef})")
+
+    orig_pt = add("CARTESIAN_POINT('',(0.,0.,0.))")
+    dir_z = add("DIRECTION('',(0.,0.,1.))")
+    dir_x = add("DIRECTION('',(1.,0.,0.))")
+    world_ax = add(f"AXIS2_PLACEMENT_3D('',#{orig_pt},#{dir_z},#{dir_x})")
+    len_unit = add("(LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT(.MILLI.,.METRE.))")
+    ang_unit = add("(NAMED_UNIT(*) PLANE_ANGLE_UNIT() SI_UNIT($,.RADIAN.))")
+    sol_unit = add("(NAMED_UNIT(*) SI_UNIT($,.STERADIAN.) SOLID_ANGLE_UNIT())")
+    uncert = add(f"UNCERTAINTY_MEASURE_WITH_UNIT(LENGTH_MEASURE(1.E-07),#{len_unit},'distance_accuracy_value','confusion accuracy')")
+    geom_ctx = add(
+        f"(GEOMETRIC_REPRESENTATION_CONTEXT(3) GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT((#{uncert})) "
+        f"GLOBAL_UNIT_ASSIGNED_CONTEXT((#{len_unit},#{ang_unit},#{sol_unit})) REPRESENTATION_CONTEXT('Context #1','3D'))"
+    )
+
+    v_cp_ids: List[int] = []
+    v_pt_ids: List[int] = []
+    for vx, vy, vz in vertices_mm:
+        cp = add(f"CARTESIAN_POINT('',({vx:.4f},{vy:.4f},{vz:.4f}))")
+        v_cp_ids.append(cp)
+        v_pt_ids.append(add(f"VERTEX_POINT('',#{cp})"))
+
+    edge_cache: dict[Tuple[int, int], int] = {}
+
+    def get_edge(a: int, b: int) -> Tuple[int, str]:
+        u, v = (a, b) if a < b else (b, a)
+        sense = ".T." if a < b else ".F."
+        cached = edge_cache.get((u, v))
+        if cached is not None:
+            return cached, sense
+        pa, pb = vertices_mm[u], vertices_mm[v]
+        dx, dy, dz = pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]
+        mag = math.sqrt(dx * dx + dy * dy + dz * dz) or 1.0
+        d_id = add(f"DIRECTION('',({dx / mag:.6f},{dy / mag:.6f},{dz / mag:.6f}))")
+        vec_id = add(f"VECTOR('',#{d_id},1.)")
+        line_id = add(f"LINE('',#{v_cp_ids[u]},#{vec_id})")
+        ec_id = add(f"EDGE_CURVE('',#{v_pt_ids[u]},#{v_pt_ids[v]},#{line_id},.T.)")
+        edge_cache[(u, v)] = ec_id
+        return ec_id, sense
+
+    face_ids: List[int] = []
+    for i0, i1, i2 in triangles_idx:
+        p0, p1, p2 = vertices_mm[i0], vertices_mm[i1], vertices_mm[i2]
+        nx, ny, nz = _cross_normal((p0[0], p0[1], p0[2]), (p1[0], p1[1], p1[2]), (p2[0], p2[1], p2[2]))
+        rx, ry, rz = p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]
+        rm = math.sqrt(rx * rx + ry * ry + rz * rz) or 1.0
+        n_dir = add(f"DIRECTION('',({nx:.6f},{ny:.6f},{nz:.6f}))")
+        r_dir = add(f"DIRECTION('',({rx / rm:.6f},{ry / rm:.6f},{rz / rm:.6f}))")
+        ax_id = add(f"AXIS2_PLACEMENT_3D('',#{v_cp_ids[i0]},#{n_dir},#{r_dir})")
+        pln_id = add(f"PLANE('',#{ax_id})")
+
+        e0, s0 = get_edge(i0, i1)
+        e1, s1 = get_edge(i1, i2)
+        e2, s2 = get_edge(i2, i0)
+        oe0 = add(f"ORIENTED_EDGE('',*,*,#{e0},{s0})")
+        oe1 = add(f"ORIENTED_EDGE('',*,*,#{e1},{s1})")
+        oe2 = add(f"ORIENTED_EDGE('',*,*,#{e2},{s2})")
+        loop_id = add(f"EDGE_LOOP('',(#{oe0},#{oe1},#{oe2}))")
+        bound_id = add(f"FACE_OUTER_BOUND('',#{loop_id},.T.)")
+        face_ids.append(add(f"ADVANCED_FACE('',(#{bound_id}),#{pln_id},.T.)"))
+
+    shell = add(f"CLOSED_SHELL('Closed Shell',({','.join(f'#{fid}' for fid in face_ids)}))")
+    solid = add(f"MANIFOLD_SOLID_BREP('PhotoCAD_Solid',#{shell})")
+    shape_rep = add(f"ADVANCED_BREP_SHAPE_REPRESENTATION('PhotoCAD Part Shape',(#{solid},#{world_ax}),#{geom_ctx})")
+    add(f"SHAPE_DEFINITION_REPRESENTATION(#{pds},#{shape_rep})")
+
+    step_text = "\n".join([
+        "ISO-10303-21;",
+        "HEADER;",
+        f"FILE_DESCRIPTION(('PhotoCAD Sculpted B-Rep Solid ({length_x:.2f}x{width_y:.2f}x{height_z:.2f} mm)'),'2;1');",
+        f"FILE_NAME('PhotoCAD_Model.step','{ts}',('PhotoCAD LangGraph'),('PhotoCAD'),'OpenCascade/build123d','PhotoCAD Kernel','');",
+        "FILE_SCHEMA(('AUTOMOTIVE_DESIGN { 1 0 10303 214 }'));",
+        "ENDSEC;",
+        "DATA;",
+        *entities,
+        "ENDSEC;",
+        "END-ISO-10303-21;\n",
+    ])
+
+    path = Path(output_step_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(step_text, encoding="utf-8")
+    return path
+
+
+def write_silhouette_dxf(
+    output_dxf_path: str | Path,
+    contours_2d: dict,
+    length_x: float,
+    width_y: float,
+    height_z: float,
+    hole_radius_mm: float = 0.0,
+) -> Path:
+    """Exports real 3-view orthographic silhouette outlines (Top XY, Front XZ, Right YZ) in 1:1 mm DXF."""
+    gap = max(25.0, min(length_x, width_y) * 0.25)
+    hx, hy, hz = length_x / 2.0, width_y / 2.0, height_z / 2.0
+    entities: List[str] = []
+
+    def poly_lines(pts_norm: List[Tuple[float, float]], cx: float, cy: float, sx: float, sy: float) -> None:
+        if len(pts_norm) < 3:
+            pts_norm = [(-0.5, -0.5), (0.5, -0.5), (0.5, 0.5), (-0.5, 0.5)]
+        n = len(pts_norm)
+        for i in range(n):
+            p1 = pts_norm[i]
+            p2 = pts_norm[(i + 1) % n]
+            entities.extend([
+                "0", "LINE", "8", "GEOMETRY",
+                "10", f"{cx + p1[0] * sx:.4f}", "20", f"{cy + p1[1] * sy:.4f}", "30", "0.0",
+                "11", f"{cx + p2[0] * sx:.4f}", "21", f"{cy + p2[1] * sy:.4f}", "31", "0.0",
+            ])
+
+    # Top View (XY) at (0, 0)
+    poly_lines(contours_2d.get("xy", []), 0.0, 0.0, length_x, width_y)
+    if hole_radius_mm > 0.5 and hole_radius_mm < min(hx, hy):
+        entities.extend([
+            "0", "CIRCLE", "8", "GEOMETRY",
+            "10", "0.0", "20", "0.0", "30", "0.0",
+            "40", f"{hole_radius_mm:.4f}",
+        ])
+
+    # Front View (XZ) above Top View
+    front_y = hy + gap + hz
+    poly_lines(contours_2d.get("xz", []), 0.0, front_y, length_x, height_z)
+
+    # Right View (YZ) right of Front View
+    right_x = hx + gap + hy
+    poly_lines(contours_2d.get("yz", []), right_x, front_y, width_y, height_z)
+
+    entities.extend([
+        "0", "TEXT", "8", "ANNOTATIONS",
+        "10", f"{-hx:.4f}", "20", f"{-hy - 12.0:.4f}", "30", "0.0",
+        "40", "3.5",
+        "1", f"PHOTOCAD SCULPTED 1:1 MM | {length_x:.2f} x {width_y:.2f} x {height_z:.2f} mm",
     ])
 
     dxf_lines = [

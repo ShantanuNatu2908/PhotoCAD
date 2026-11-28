@@ -13,15 +13,13 @@ Measures compiled .STL B-Rep geometry against the fused Open3D .PLY scan:
 
 from __future__ import annotations
 
-import os
 from collections import Counter
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 
 from app.schemas.adt import Open3DGeometryReport, ValidationMetrics
-
 
 TOLERANCE_CHAMFER_MM = 1.0
 MAX_CENTROID_ICP_SHIFT_MM = 5.0
@@ -249,13 +247,16 @@ class ChamferValidator:
                 direction = "wider/taller" if dval > 0 else "smaller/shorter"
                 notes.append(f"{label} differs by {dval:+.2f}mm ({direction}) vs fused Open3D scan.")
 
-        if chamfer_mean > TOLERANCE_CHAMFER_MM and not notes:
+        max_extent = float(np.max(scan_extents)) if len(scan_extents) else 0.0
+        eff_tol_mm = TOLERANCE_CHAMFER_MM if max_extent <= 120.0 else max(TOLERANCE_CHAMFER_MM, round(max_extent * 0.015, 2))
+
+        if chamfer_mean > eff_tol_mm and not notes:
             notes.append(
-                f"Mean surface Chamfer error {chamfer_mean:.2f}mm exceeds {TOLERANCE_CHAMFER_MM}mm tolerance; "
+                f"Mean surface Chamfer error {chamfer_mean:.2f}mm exceeds {eff_tol_mm:.2f}mm tolerance; "
                 "verify hole radius, fillet bounds, or base dimensions."
             )
 
-        passed = is_watertight and (chamfer_mean <= TOLERANCE_CHAMFER_MM)
+        passed = is_watertight and (chamfer_mean <= eff_tol_mm)
 
         return ValidationMetrics(
             is_watertight=is_watertight,

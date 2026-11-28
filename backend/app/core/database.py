@@ -1,6 +1,9 @@
 from typing import AsyncGenerator
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import declarative_base
+
 from app.core.config import settings
 
 engine = create_async_engine(
@@ -26,9 +29,6 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
         finally:
             await session.close()
 
-from sqlalchemy import text
-
-
 async def _migrate_sqlite_columns(conn) -> None:
     """Idempotently adds Phase 3 columns to existing local SQLite scan_sessions tables."""
     if "sqlite" not in settings.DATABASE_URL:
@@ -46,7 +46,31 @@ async def _migrate_sqlite_columns(conn) -> None:
             await conn.execute(text(ddl))
 
 
+async def _migrate_tenant_columns(conn) -> None:
+    """Idempotently adds tenant_id to legacy rows on SQLite and PostgreSQL."""
+    from sqlalchemy import inspect
+
+    for table in ("projects", "scan_sessions", "cad_generations"):
+        columns = await conn.run_sync(
+            lambda sync_conn, t=table: [column["name"] for column in inspect(sync_conn).get_columns(t)]
+        )
+        if "tenant_id" in columns:
+            continue
+        await conn.execute(text(
+            f"ALTER TABLE {table} ADD COLUMN tenant_id VARCHAR(64) DEFAULT 'public' NOT NULL"
+        ))
+        await conn.execute(text(f"UPDATE {table} SET tenant_id = 'public' WHERE tenant_id IS NULL"))
+        try:
+            await conn.execute(text(
+                f"CREATE INDEX IF NOT EXISTS ix_{table}_tenant_id ON {table} (tenant_id)"
+            ))
+        except Exception:
+            # Some engines reject IF NOT EXISTS; the column migration still succeeded.
+            pass
+
+
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await _migrate_sqlite_columns(conn)
+        await _migrate_tenant_columns(conn)

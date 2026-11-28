@@ -10,8 +10,10 @@ These Pydantic v2 schemas govern the mathematical boundary between:
 """
 
 from enum import Enum
-from typing import Literal, Optional, List, Dict, Tuple, Union
-from pydantic import BaseModel, Field, ConfigDict
+from typing import Dict, List, Literal, Optional, Tuple, Union
+
+from pydantic import BaseModel, ConfigDict, Field
+
 
 class CaptureSide(str, Enum):
     """The 6 orthogonal perspectives required for full volumetric capture."""

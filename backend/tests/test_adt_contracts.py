@@ -5,16 +5,16 @@ Document ID: PCAD-API-ADT-003
 
 import pytest
 from pydantic import ValidationError
+
 from app.schemas.adt import (
-    CaptureSide,
     CalibrationSpec,
-    DetectedPlane,
-    DetectedCylinder,
-    Open3DGeometryReport,
-    FeatureStep,
+    CaptureSide,
     CSGFeatureTree,
-    ValidationMetrics
+    FeatureStep,
+    Open3DGeometryReport,
+    ValidationMetrics,
 )
+
 
 def test_calibration_spec_validation():
     # Valid known dimension

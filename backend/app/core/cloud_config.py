@@ -9,13 +9,21 @@ Monitors connection health to:
 4. Modal Serverless GPU (NVIDIA L4 Cloud Compute)
 """
 
-import os
 import asyncio
+import os
 import sqlite3
-from typing import Dict, Any
+from typing import Any, Dict
+
 from sqlalchemy import text
-from app.core.database import AsyncSessionLocal
+
+from app.core.cloud_auth import (
+    detect_active_pipeline_engines,
+    is_modal_configured,
+    set_modal_deploy_cache,
+)
 from app.core.config import settings
+from app.core.database import AsyncSessionLocal
+
 
 class CloudHealthService:
     """Verifies connectivity to all 4 managed cloud tiers."""
@@ -107,34 +115,45 @@ class CloudHealthService:
     @staticmethod
     async def check_modal_gpu() -> Dict[str, Any]:
         """Tests Modal Serverless Cloud GPU health function."""
-        token_id = os.getenv("MODAL_TOKEN_ID", "")
-
-        if not token_id or "your-modal" in token_id:
+        if not is_modal_configured():
             return {
                 "tier": "Compute (Serverless Cloud GPU)",
                 "provider": "Modal (NVIDIA L4 / A10G)",
                 "status": "dev_mock_connected",
                 "target_gpu": "NVIDIA L4 (FP16 / BF16)",
-                "note": "Run 'modal token set' or set MODAL_TOKEN_ID in .env to trigger live remote GPU."
+                "note": "Run 'modal setup' or set MODAL_TOKEN_ID/MODAL_TOKEN_SECRET in .env to run live SAM 2.1 + Open3D GPU."
             }
 
-        try:
+        def _probe_modal() -> Dict[str, Any]:
             import modal
-            health_fn = modal.Function.lookup("photocad-gpu", "health_check_gpu")
-            res = health_fn.remote()
+            try:
+                fn = modal.Function.from_name("photocad-gpu", "run_full_cv_pipeline")
+            except AttributeError:
+                fn = modal.Function.lookup("photocad-gpu", "run_full_cv_pipeline")  # type: ignore[attr-defined]
+            fn.hydrate()
+            return {"deployed_app": "photocad-gpu", "function": "run_full_cv_pipeline"}
+
+        try:
+            res = await asyncio.wait_for(asyncio.to_thread(_probe_modal), timeout=5.0)
+            set_modal_deploy_cache(True)
             return {
                 "tier": "Compute (Serverless Cloud GPU)",
-                "provider": "Modal",
+                "provider": "Modal (NVIDIA L4 BF16)",
                 "status": "connected",
-                "remote_telemetry": res
+                "remote_telemetry": res,
             }
         except Exception as e:
+            set_modal_deploy_cache(False)
             return {
                 "tier": "Compute (Serverless Cloud GPU)",
-                "provider": "Modal",
-                "status": "simulated_ready",
+                "provider": "Modal (NVIDIA L4)",
+                "status": "not_deployed",
                 "target_gpu": "NVIDIA L4",
-                "message": str(e)
+                "note": (
+                    "Modal tokens loaded, but 'photocad-gpu' is not deployed. "
+                    "Add a billing card at modal.com/settings/billing (free $30/mo credit) and run `modal deploy gpu_workers/modal_app.py`."
+                ),
+                "message": str(e),
             }
 
     @classmethod
@@ -147,14 +166,16 @@ class CloudHealthService:
             cls.check_modal_gpu()
         )
 
+        modal_deployed = gpu_res.get("status") == "connected"
         all_healthy = all(
             tier.get("status") in ["connected", "dev_mock_connected", "simulated_ready"]
             for tier in [db_res, redis_res, r2_res, gpu_res]
         )
 
         return {
-            "status": "healthy" if all_healthy else "degraded",
+            "status": "healthy" if all_healthy else ("partial" if gpu_res.get("status") == "not_deployed" else "degraded"),
             "architecture": "Zero-Heat Cloud-First (PCAD-SAD-002)",
+            "active_engines": detect_active_pipeline_engines(modal_deployed=modal_deployed),
             "cloud_tiers": {
                 "database_supabase": db_res,
                 "cache_redis_upstash": redis_res,

@@ -11,11 +11,10 @@ from __future__ import annotations
 import io
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 from PIL import Image
-
 
 DEFAULT_SAM2_MODEL_ID = "facebook/sam2.1-hiera-small"
 
@@ -272,7 +271,7 @@ class Sam2SegmentationWorker:
         gc_mask = np.full((h, w), cv2.GC_PR_BGD, dtype=np.uint8)
         bx0, by0, bx1, by1 = prompts["input_box"]
         gc_mask[by0:by1, bx0:bx1] = cv2.GC_PR_FGD
-        for (px, py), lbl in zip(prompts["input_points"], prompts["input_labels"]):
+        for (px, py), lbl in zip(prompts["input_points"], prompts["input_labels"], strict=False):
             py_c, px_c = min(max(py, 0), h - 1), min(max(px, 0), w - 1)
             cv2.circle(gc_mask, (px_c, py_c), 8, cv2.GC_FGD if lbl == 1 else cv2.GC_BGD, -1)
 

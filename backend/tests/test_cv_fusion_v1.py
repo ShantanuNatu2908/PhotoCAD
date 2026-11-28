@@ -17,7 +17,6 @@ from app.core.database import init_db
 from app.main import app
 from app.schemas.adt import Open3DGeometryReport
 
-
 asyncio.run(init_db())
 client = TestClient(app)
 
@@ -27,8 +26,11 @@ SIX_SIDES = ["front", "back", "left", "right", "top", "bottom"]
 def _make_synthetic_png_bytes(width: int = 320, height: int = 240) -> bytes:
     """Generates a deterministic mechanical-part test PNG with crisp foreground box & background."""
     arr = np.full((height, width, 3), 24, dtype=np.uint8)  # Dark studio desk background
-    # Metallic silver bracket silhouette in center
+    import cv2
+
+    # Metallic silver bracket silhouette with real circular center mounting bore
     arr[50:190, 70:250] = [175, 195, 210]
+    cv2.circle(arr, (width // 2, height // 2), 20, (24, 24, 24), -1)
     # Simulated holding skin band on bottom-left corner (tests hand stripping)
     arr[195:240, 0:65] = [210, 150, 125]
     buf = io.BytesIO()
@@ -183,7 +185,7 @@ def test_modal_remote_gpu_dispatch_contract():
     fake_modal = MagicMock()
     fake_modal.Function.from_name.return_value = mock_fn
 
-    with patch("app.services.cv_pipeline_service._is_modal_configured", return_value=True), \
+    with patch("app.services.cv_pipeline_service.is_modal_configured", return_value=True), \
          patch.dict("sys.modules", {"modal": fake_modal}):
         fuse_res = client.post(f"/api/scans/{scan_id}/fuse")
 

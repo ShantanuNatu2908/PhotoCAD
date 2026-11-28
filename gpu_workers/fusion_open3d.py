@@ -14,12 +14,10 @@ Pipeline:
 
 from __future__ import annotations
 
-import io
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-
 
 MIN_ICP_FITNESS_THRESHOLD = 0.65
 
@@ -123,7 +121,7 @@ def serialize_ply_bytes(points_mm: np.ndarray, colors_rgb: Optional[np.ndarray] 
     ])
 
     lines = [header]
-    for p, c in zip(points_mm, cols_u8):
+    for p, c in zip(points_mm, cols_u8, strict=False):
         lines.append(f"{p[0]:.3f} {p[1]:.3f} {p[2]:.3f} {int(c[0])} {int(c[1])} {int(c[2])}")
 
     return ("\n".join(lines) + "\n").encode("utf-8")

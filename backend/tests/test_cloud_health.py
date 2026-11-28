@@ -4,7 +4,9 @@ Document ID: PCAD-SAD-002
 """
 
 import asyncio
+
 from app.core.cloud_config import CloudHealthService
+
 
 def test_database_connectivity():
     res = asyncio.run(CloudHealthService.check_database())

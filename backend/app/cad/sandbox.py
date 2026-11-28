@@ -14,15 +14,23 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import json
 import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from app.cad.exporter import write_orthographic_dxf, write_parametric_stl, write_step_ap214
+from app.cad.exporter import (
+    write_faceted_hull_step,
+    write_mesh_stl,
+    write_orthographic_dxf,
+    write_parametric_stl,
+    write_silhouette_dxf,
+    write_step_ap214,
+)
+from app.core.cloud_auth import is_modal_configured
 from app.core.config import settings
-
 
 ALLOWED_IMPORTS = {"build123d", "math", "numpy"}
 FORBIDDEN_BUILTINS = {
@@ -201,9 +209,7 @@ class CadSandboxExecutor:
 
     @staticmethod
     def _modal_enabled() -> bool:
-        tid = os.getenv("MODAL_TOKEN_ID", "")
-        tsec = os.getenv("MODAL_TOKEN_SECRET", "")
-        return bool(tid and "your-modal" not in tid and tsec and "your-modal" not in tsec)
+        return is_modal_configured()
 
     @classmethod
     async def execute(
@@ -241,7 +247,7 @@ class CadSandboxExecutor:
                 try:
                     sandbox_fn = modal.Function.from_name("photocad-gpu", "run_build123d_sandbox")
                 except AttributeError:
-                    sandbox_fn = modal.Function.lookup("photocad-gpu", "run_build123d_sandbox")
+                    sandbox_fn = modal.Function.lookup("photocad-gpu", "run_build123d_sandbox")  # type: ignore[attr-defined]
 
                 res: Dict[str, Any] = await asyncio.to_thread(sandbox_fn.remote, code=code)
                 if not res.get("success"):
@@ -291,9 +297,37 @@ class CadSandboxExecutor:
                 elapsed_ms=round((time.perf_counter() - t0) * 1000.0, 2),
             )
 
-        write_step_ap214(step_path, dims["x"], dims["y"], dims["z"], hole_radius_mm=hole_rad)
-        write_parametric_stl(stl_path, dims["x"], dims["y"], dims["z"], hole_radius_mm=hole_rad)
-        write_orthographic_dxf(dxf_path, dims["x"], dims["y"], dims["z"], hole_radius_mm=hole_rad)
+        hull_path = out_base / "visual_hull.json"
+        used_hull = False
+        if hull_path.exists() and ("Polygon(" in code or "Mode.INTERSECT" in code):
+            try:
+                hull = json.loads(hull_path.read_text(encoding="utf-8"))
+                verts_raw = hull.get("vertices_mm") or []
+                tris_idx = hull.get("triangles_idx") or []
+                if hull.get("is_sculpted") and len(verts_raw) > 12 and len(tris_idx) > 12:
+                    hd = hull.get("dimensions_mm") or {}
+                    sx = dims["x"] / max(float(hd.get("x") or dims["x"]), 1.0)
+                    sy = dims["y"] / max(float(hd.get("y") or dims["y"]), 1.0)
+                    sz = dims["z"] / max(float(hd.get("z") or dims["z"]), 1.0)
+                    scaled_verts = [[v[0] * sx, v[1] * sy, v[2] * sz] for v in verts_raw]
+                    write_mesh_stl(stl_path, scaled_verts, tris_idx)
+                    write_faceted_hull_step(step_path, scaled_verts, tris_idx, dims["x"], dims["y"], dims["z"])
+                    write_silhouette_dxf(
+                        dxf_path,
+                        hull.get("contours_2d") or {},
+                        dims["x"],
+                        dims["y"],
+                        dims["z"],
+                        hole_radius_mm=hole_rad,
+                    )
+                    used_hull = True
+            except Exception:
+                used_hull = False
+
+        if not used_hull:
+            write_step_ap214(step_path, dims["x"], dims["y"], dims["z"], hole_radius_mm=hole_rad)
+            write_parametric_stl(stl_path, dims["x"], dims["y"], dims["z"], hole_radius_mm=hole_rad)
+            write_orthographic_dxf(dxf_path, dims["x"], dims["y"], dims["z"], hole_radius_mm=hole_rad)
         py_path.write_text(code, encoding="utf-8")
 
         rel_prefix = f"/storage/cad_exports/{scan_id}"

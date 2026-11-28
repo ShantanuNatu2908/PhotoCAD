@@ -15,15 +15,21 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import io
 import os
 import time
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
-from PIL import Image
 
+from app.cad.visual_hull import carve_visual_hull_from_views, extract_foreground_mask
+from app.core.cloud_auth import (
+    detect_active_pipeline_engines,
+    get_cached_modal_deployed,
+    is_modal_configured,
+    set_modal_deploy_cache,
+)
+from app.core.config import settings
 from app.schemas.adt import (
     CaptureSide,
     DetectedCylinder,
@@ -32,8 +38,17 @@ from app.schemas.adt import (
 )
 from app.services.r2_storage import r2_storage
 
-
 WsEventCallback = Optional[Callable[[Dict[str, Any]], Awaitable[None]]]
+
+
+def _smooth_surfaces_enabled() -> bool:
+    """Opt-in C2 patches; the verified faceted watertight shell stays authoritative."""
+    return os.getenv("PHOTOCAD_SMOOTH_SURFACES", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 class CVPipelineError(Exception):
@@ -45,17 +60,6 @@ class CVPipelineError(Exception):
         self.message = message
         self.status_code = status_code
         self.details = details or {}
-
-
-def _is_modal_configured() -> bool:
-    token_id = os.getenv("MODAL_TOKEN_ID", "")
-    token_secret = os.getenv("MODAL_TOKEN_SECRET", "")
-    return bool(
-        token_id
-        and "your-modal" not in token_id
-        and token_secret
-        and "your-modal" not in token_secret
-    )
 
 
 def _serialize_ascii_ply(points_mm: np.ndarray, colors_rgb: np.ndarray) -> bytes:
@@ -76,55 +80,16 @@ def _serialize_ascii_ply(points_mm: np.ndarray, colors_rgb: np.ndarray) -> bytes
         "end_header",
     ])
     lines = [header]
-    for pt, col in zip(points_mm, cols_u8):
+    for pt, col in zip(points_mm, cols_u8, strict=False):
         lines.append(f"{pt[0]:.3f} {pt[1]:.3f} {pt[2]:.3f} {int(col[0])} {int(col[1])} {int(col[2])}")
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
 def _extract_dev_foreground_mask(rgb_arr: np.ndarray) -> Tuple[np.ndarray, int]:
     """
-    Zero-Heat offline hand/background isolator (replaces SAM 2.1 when Modal is unconfigured).
-    Suppresses border-connected YCrCb skin regions and outer background matte pixels.
+    Zero-Heat offline hand/background isolator (GrabCut + uniform studio matte + YCrCb skin stripping).
     """
-    import cv2
-
-    h, w = rgb_arr.shape[:2]
-    # Border-mean background separation + YCrCb skin suppression
-    border_pixels = np.concatenate([
-        rgb_arr[0, :, :],
-        rgb_arr[-1, :, :],
-        rgb_arr[:, 0, :],
-        rgb_arr[:, -1, :],
-    ], axis=0)
-    bg_median = np.median(border_pixels, axis=0)
-    color_dist = np.linalg.norm(rgb_arr.astype(np.float32) - bg_median.astype(np.float32), axis=-1)
-
-    ycrcb = cv2.cvtColor(rgb_arr, cv2.COLOR_RGB2YCrCb)
-    skin_u8 = cv2.inRange(ycrcb, np.array([40, 133, 77]), np.array([245, 173, 127]))
-
-    # Remove whole skin components connected to the frame perimeter (hands/fingers holding part)
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(skin_u8, connectivity=8)
-    hand_mask = np.zeros((h, w), dtype=bool)
-    margin_x, margin_y = max(3, int(w * 0.03)), max(3, int(h * 0.03))
-    for lbl in range(1, num_labels):
-        x, y, bw, bh, area = stats[lbl]
-        if area < 25:
-            continue
-        touches_border = (
-            x <= margin_x or y <= margin_y or (x + bw) >= (w - margin_x) or (y + bh) >= (h - margin_y)
-        )
-        if touches_border:
-            hand_mask |= (labels == lbl)
-
-    hand_suppressed = int(np.sum(hand_mask))
-    fg_mask = (color_dist > 22.0) & ~hand_mask
-
-    # If the synthetic image is solid or uniform without sharp BG separation, preserve central 60% ROI
-    if float(np.mean(fg_mask)) < 0.03:
-        fg_mask = np.zeros((h, w), dtype=bool)
-        fg_mask[int(h * 0.18):int(h * 0.82), int(w * 0.18):int(w * 0.82)] = True
-
-    return fg_mask, hand_suppressed
+    return extract_foreground_mask(rgb_arr)
 
 
 def _offline_zero_heat_fusion(
@@ -134,104 +99,29 @@ def _offline_zero_heat_fusion(
     ply_object_key: str,
 ) -> Tuple[Open3DGeometryReport, bytes, Dict[str, bytes], Dict[str, Any]]:
     """
-    Deterministic Zero-Heat local simulator/fallback when Modal credentials are not configured.
-    Reads actual uploaded .PNG views (or calibrated synthetic geometry when running API-only tests),
-    creates masked RGBA assets, projects all 6 surfaces into a metric-scaled 3D point cloud (.PLY),
-    and returns a validated Open3DGeometryReport.
+    Deterministic Zero-Heat 4..6 view Visual Hull & Mask Fusion when Modal credentials are not configured.
+    Isolates real foreground silhouettes, computes true aspect-matched mm extents, carves a 3D volumetric
+    visual hull, writes smoothed manifold STL/STEP/DXF contour cache, and emits Open3DGeometryReport.
     """
     t0 = time.perf_counter()
 
-    known_length = float(calibration_spec.get("known_length_mm") or 80.0)
-    mm_per_px = calibration_spec.get("mm_per_unit")
-    ref_side = calibration_spec.get("reference_side", "front")
+    hull_out_path = settings.EXPORTS_DIR / scan_id / "visual_hull.json"
+    hull_res = carve_visual_hull_from_views(
+        scan_id=scan_id,
+        view_images=view_images,
+        calibration_spec=calibration_spec,
+        hull_output_path=hull_out_path,
+        smooth_surfaces=_smooth_surfaces_enabled(),
+    )
 
-    masked_pngs: Dict[str, bytes] = {}
-    side_extents_mm: Dict[str, Tuple[float, float]] = {}
-    side_colors: Dict[str, np.ndarray] = {}
-
-    for side in [s.value for s in CaptureSide]:
-        raw = view_images.get(side)
-        if raw:
-            img = Image.open(io.BytesIO(raw)).convert("RGB")
-            arr = np.asarray(img, dtype=np.uint8)
-            h, w = arr.shape[:2]
-            fg_mask, _ = _extract_dev_foreground_mask(arr)
-
-            rgba = np.zeros((h, w, 4), dtype=np.uint8)
-            rgba[fg_mask, :3] = arr[fg_mask]
-            rgba[fg_mask, 3] = 255
-            out_buf = io.BytesIO()
-            Image.fromarray(rgba, mode="RGBA").save(out_buf, format="PNG")
-            masked_pngs[side] = out_buf.getvalue()
-
-            ys, xs = np.where(fg_mask)
-            fg_w_px = float(np.max(xs) - np.min(xs)) if len(xs) > 1 else w * 0.55
-            fg_h_px = float(np.max(ys) - np.min(ys)) if len(ys) > 1 else h * 0.55
-            eff_scale = float(mm_per_px) if (mm_per_px and float(mm_per_px) > 0) else (known_length / max(fg_w_px, 1.0))
-            side_extents_mm[side] = (round(fg_w_px * eff_scale, 2), round(fg_h_px * eff_scale, 2))
-            side_colors[side] = np.mean(arr[fg_mask], axis=0) if np.any(fg_mask) else np.array([0.0, 200.0, 230.0])
-        else:
-            side_colors[side] = np.array([20.0, 210.0, 240.0])
-
-    # Derive consistent physical box dimensions (X, Y, Z) in mm anchored on calibration_spec
-    if ref_side in side_extents_mm:
-        w_mm, h_mm = side_extents_mm[ref_side]
-        length_x = max(min(w_mm, 500.0), 10.0)
-        height_z = max(min(h_mm, 500.0), 8.0)
-        width_y = round(length_x * 0.625, 2)
-    else:
-        length_x = round(max(known_length, 15.0), 2)
-        width_y = round(length_x * 0.625, 2)
-        height_z = round(length_x * 0.375, 2)
-
-    hx, hy, hz = length_x / 2.0, width_y / 2.0, height_z / 2.0
-
-    # Sample dense surface points across all 6 faces + central cylindrical bore feature
-    rng = np.random.default_rng(seed=2026)
-    pts_list: List[np.ndarray] = []
-    cols_list: List[np.ndarray] = []
-
-    hole_radius = round(min(hx, hy) * 0.32, 2)
-
-    # Top & Bottom (+Z / -Z faces with cylindrical cutout void)
-    for sign_z, side_key in [(1.0, "top"), (-1.0, "bottom")]:
-        grid_x = rng.uniform(-hx, hx, size=900)
-        grid_y = rng.uniform(-hy, hy, size=900)
-        outside_hole = (grid_x ** 2 + grid_y ** 2) > (hole_radius ** 2)
-        gx, gy = grid_x[outside_hole], grid_y[outside_hole]
-        gz = np.full(len(gx), sign_z * hz) + rng.normal(0.0, 0.08, size=len(gx))
-        pts_list.append(np.column_stack([gx, gy, gz]))
-        c = side_colors.get(side_key, np.array([0.0, 210.0, 235.0]))
-        cols_list.append(np.tile(c, (len(gx), 1)))
-
-    # Front & Back (+Y / -Y faces)
-    for sign_y, side_key in [(1.0, "front"), (-1.0, "back")]:
-        gx = rng.uniform(-hx, hx, size=550)
-        gz = rng.uniform(-hz, hz, size=550)
-        gy = np.full(len(gx), sign_y * hy) + rng.normal(0.0, 0.08, size=len(gx))
-        pts_list.append(np.column_stack([gx, gy, gz]))
-        c = side_colors.get(side_key, np.array([25.0, 185.0, 225.0]))
-        cols_list.append(np.tile(c, (len(gx), 1)))
-
-    # Left & Right (-X / +X faces)
-    for sign_x, side_key in [(-1.0, "left"), (1.0, "right")]:
-        gy = rng.uniform(-hy, hy, size=400)
-        gz = rng.uniform(-hz, hz, size=400)
-        gx = np.full(len(gy), sign_x * hx) + rng.normal(0.0, 0.08, size=len(gy))
-        pts_list.append(np.column_stack([gx, gy, gz]))
-        c = side_colors.get(side_key, np.array([15.0, 175.0, 215.0]))
-        cols_list.append(np.tile(c, (len(gy), 1)))
-
-    # Internal Cylindrical Through-Hole Wall
-    theta = rng.uniform(0.0, 2.0 * np.pi, size=420)
-    z_cyl = rng.uniform(-hz, hz, size=420)
-    pts_list.append(np.column_stack([hole_radius * np.cos(theta), hole_radius * np.sin(theta), z_cyl]))
-    cols_list.append(np.tile(np.array([255.0, 185.0, 30.0]), (len(theta), 1)))
-
-    all_pts = np.vstack(pts_list)
-    all_cols = np.vstack(cols_list)
+    masked_pngs: Dict[str, bytes] = hull_res["masked_pngs"]
+    all_pts = hull_res["points_mm"]
+    all_cols = hull_res["colors_rgb"]
+    length_x, width_y, height_z = hull_res["dimensions_mm"]
+    hole_radius = float(hull_res["detected_hole_radius_mm"])
     ply_bytes = _serialize_ascii_ply(all_pts, all_cols)
 
+    hx, hy, hz = length_x / 2.0, width_y / 2.0, height_z / 2.0
     planes = [
         DetectedPlane(plane_id="plane_01", normal=(0.0, 0.0, 1.0), centroid_mm=(0.0, 0.0, round(hz, 2)), area_mm2=round(length_x * width_y, 2), inlier_ratio=0.22),
         DetectedPlane(plane_id="plane_02", normal=(0.0, 0.0, -1.0), centroid_mm=(0.0, 0.0, round(-hz, 2)), area_mm2=round(length_x * width_y, 2), inlier_ratio=0.22),
@@ -241,17 +131,19 @@ def _offline_zero_heat_fusion(
         DetectedPlane(plane_id="plane_06", normal=(-1.0, 0.0, 0.0), centroid_mm=(round(-hx, 2), 0.0, 0.0), area_mm2=round(width_y * height_z, 2), inlier_ratio=0.10),
     ]
 
-    cylinders = [
-        DetectedCylinder(
-            cylinder_id="cyl_center_bore_01",
-            kind="through_hole",
-            axis_origin_mm=(0.0, 0.0, 0.0),
-            axis_direction=(0.0, 0.0, 1.0),
-            radius_mm=hole_radius,
-            depth_mm=round(height_z, 2),
-            confidence=0.94,
+    cylinders: List[DetectedCylinder] = []
+    if hole_radius > 0.5:
+        cylinders.append(
+            DetectedCylinder(
+                cylinder_id="cyl_center_bore_01",
+                kind="through_hole",
+                axis_origin_mm=(0.0, 0.0, 0.0),
+                axis_direction=(0.0, 0.0, 1.0),
+                radius_mm=hole_radius,
+                depth_mm=round(height_z, 2),
+                confidence=0.92,
+            )
         )
-    ]
 
     report = Open3DGeometryReport(
         scan_id=scan_id,
@@ -261,16 +153,20 @@ def _offline_zero_heat_fusion(
         icp_inlier_rmse_mm=0.28,
         bounding_box_mm=(round(length_x, 2), round(width_y, 2), round(height_z, 2)),
         principal_axes=[(1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)],
-        symmetry_planes=["XY", "YZ", "XZ"],
+        symmetry_planes=["YZ"],
         planes=planes,
         cylinders=cylinders,
         ply_object_key=ply_object_key,
     )
 
     telemetry = {
-        "mode": "zero_heat_dev_fusion",
+        "mode": "zero_heat_visual_hull",
+        "is_sculpted": bool(hull_res["is_sculpted"]),
+        "fill_ratio": hull_res["fill_ratio"],
         "elapsed_ms": round((time.perf_counter() - t0) * 1000.0, 2),
-        "views_processed": 6,
+        "views_processed": hull_res["views_used"],
+        "surface_mode": hull_res["surface_mode"],
+        "max_surface_deviation_mm": hull_res.get("max_surface_deviation_mm"),
     }
     return report, ply_bytes, masked_pngs, telemetry
 
@@ -303,9 +199,10 @@ class CVPipelineService:
         has_scale_reference: bool,
         calibration_spec: Optional[Dict[str, Any]],
         ws_broadcast: WsEventCallback = None,
+        strict_cloud: bool = False,
     ) -> Dict[str, Any]:
         """
-        Executes Phase 3 CV & 3D Fusion pipeline for a calibrated 6-view ScanSession.
+        Executes Phase 3 CV & 3D Fusion pipeline for a calibrated 4..6-view ScanSession.
         """
         # 1. Gate: Calibration must be locked before 3D fusion
         if not has_scale_reference and not calibration_spec:
@@ -316,18 +213,28 @@ class CVPipelineService:
                 details={"scan_id": scan_id},
             )
 
-        # 2. Gate: All 6 views must be confirmed
+        # 2. Gate: Require at least 4 confirmed perspectives (accepts 4, 5, or 6 views)
         required_sides = [s.value for s in CaptureSide]
-        missing_sides = [
+        confirmed_sides = [
             s for s in required_sides
-            if (views_data.get(s) or {}).get("status") != "confirmed"
+            if (views_data.get(s) or {}).get("status") == "confirmed"
         ]
-        if missing_sides:
+        missing_sides = [s for s in required_sides if s not in confirmed_sides]
+        if len(confirmed_sides) < 4:
             raise CVPipelineError(
                 code="VIEWS_INCOMPLETE",
-                message=f"All 6 perspectives must be confirmed before fusion. Missing: {', '.join(missing_sides)}.",
+                message=f"At least 4 orthogonal views are required before 3D fusion (6 recommended). Missing: {', '.join(missing_sides)}.",
                 status_code=400,
-                details={"scan_id": scan_id, "missing_sides": missing_sides},
+                details={"scan_id": scan_id, "missing_sides": missing_sides, "confirmed_count": len(confirmed_sides)},
+            )
+
+        modal_ready = is_modal_configured()
+        if strict_cloud and not modal_ready:
+            raise CVPipelineError(
+                code="CLOUD_GPU_UNAVAILABLE",
+                message="Strict Cloud High-Accuracy Mode is enabled, but Modal credentials (.env / `modal setup`) are not configured.",
+                status_code=503,
+                details={"scan_id": scan_id, "active_engines": detect_active_pipeline_engines()},
             )
 
         calib = calibration_spec or views_data.get("_calibration") or {
@@ -342,7 +249,7 @@ class CVPipelineService:
             scan_id,
             "cv_segmentation_started",
             10,
-            {"views_count": len(required_sides)},
+            {"views_count": len(confirmed_sides), "modal_enabled": modal_ready},
         )
 
         # Gather local view image bytes if present (or build data URIs for Modal)
@@ -352,27 +259,33 @@ class CVPipelineService:
             raw_key = f"uploads/{scan_id}/{side}.png"
             raw_bytes = r2_storage.read_local_bytes(raw_key)
             view_images[side] = raw_bytes
-            if r2_storage.is_r2_configured:
-                keyframe_inputs[side] = r2_storage.generate_presigned_url(raw_key, method="GET", expires_in=900)
-            elif raw_bytes:
-                keyframe_inputs[side] = "data:image/png;base64," + base64.b64encode(raw_bytes).decode("ascii")
+            if raw_bytes:
+                if r2_storage.is_r2_configured:
+                    keyframe_inputs[side] = r2_storage.generate_presigned_url(raw_key, method="GET", expires_in=900)
+                else:
+                    keyframe_inputs[side] = "data:image/png;base64," + base64.b64encode(raw_bytes).decode("ascii")
 
-        # Branch: Remote Modal GPU Execution when configured
-        if _is_modal_configured() and len(keyframe_inputs) == 6:
+        # Branch: Remote Modal GPU Execution when configured & deployed (works with 4, 5, or 6 views!)
+        should_try_modal = (
+            modal_ready
+            and len(keyframe_inputs) >= 4
+            and (strict_cloud or get_cached_modal_deployed(60.0) is not False)
+        )
+        if should_try_modal:
             try:
                 import modal
 
                 try:
                     remote_fn = modal.Function.from_name("photocad-gpu", "run_full_cv_pipeline")
                 except AttributeError:
-                    remote_fn = modal.Function.lookup("photocad-gpu", "run_full_cv_pipeline")
+                    remote_fn = modal.Function.lookup("photocad-gpu", "run_full_cv_pipeline")  # type: ignore[attr-defined]
 
                 mask_put_urls = (
                     {
                         side: r2_storage.generate_presigned_url(
                             f"processed_edges/{scan_id}/{side}_masked.png", method="PUT"
                         )
-                        for side in required_sides
+                        for side in keyframe_inputs
                     }
                     if r2_storage.is_r2_configured
                     else None
@@ -403,13 +316,28 @@ class CVPipelineService:
                         details=err.get("details", {}),
                     )
 
-                # Save base64 outputs locally if R2 wasn't handling direct PUTs
+                # Save base64 outputs locally & build clean SAM2-derived visual_hull contours for downstream CAD
                 masked_urls: Dict[str, str] = {}
+                sam_rgba_bytes: Dict[str, Optional[bytes]] = {}
                 for side, meta in (modal_result.get("masked_views") or {}).items():
                     m_key = f"processed_edges/{scan_id}/{side}_masked.png"
                     if meta.get("rgba_b64"):
-                        r2_storage.save_local_bytes(m_key, base64.b64decode(meta["rgba_b64"]))
+                        decoded = base64.b64decode(meta["rgba_b64"])
+                        r2_storage.save_local_bytes(m_key, decoded)
+                        sam_rgba_bytes[side] = decoded
                     masked_urls[side] = r2_storage.generate_presigned_url(m_key, method="GET")
+
+                if sam_rgba_bytes:
+                    try:
+                        carve_visual_hull_from_views(
+                            scan_id=scan_id,
+                            view_images=sam_rgba_bytes,
+                            calibration_spec=calib,
+                            hull_output_path=settings.EXPORTS_DIR / scan_id / "visual_hull.json",
+                            smooth_surfaces=_smooth_surfaces_enabled(),
+                        )
+                    except Exception:
+                        pass
 
                 if modal_result.get("ply_b64"):
                     r2_storage.save_local_bytes(ply_key, base64.b64decode(modal_result["ply_b64"]))
@@ -430,24 +358,36 @@ class CVPipelineService:
                     },
                 )
 
+                set_modal_deploy_cache(True)
                 return {
                     "status": "fused",
                     "execution_mode": "modal_l4_gpu",
                     "geometry_report": report.model_dump(),
                     "ply_url": ply_url,
                     "masked_urls": masked_urls,
-                    "telemetry": modal_result.get("telemetry", {}),
+                    "telemetry": {
+                        **(modal_result.get("telemetry") or {}),
+                        "active_models": detect_active_pipeline_engines(modal_deployed=True),
+                    },
                 }
             except CVPipelineError:
                 raise
             except Exception as exc:
-                # Fall through cleanly in dev unless strict prod mode requires remote GPU
-                if os.getenv("ENVIRONMENT") == "production":
+                err_str = str(exc)
+                if "not found" in err_str.lower() or "payment method" in err_str.lower():
+                    set_modal_deploy_cache(False)
+                # Never silently downgrade when strict_cloud or production mode is active
+                if strict_cloud or os.getenv("ENVIRONMENT") == "production":
+                    hint = (
+                        "Add a payment method at modal.com/settings/billing (free $30/mo credit) and run `modal deploy gpu_workers/modal_app.py`"
+                        if ("not found" in err_str.lower() or "payment method" in err_str.lower())
+                        else "Run `modal deploy gpu_workers/modal_app.py`"
+                    )
                     raise CVPipelineError(
                         code="MODAL_DISPATCH_ERROR",
-                        message=f"Failed to execute Modal GPU CV pipeline: {exc}",
+                        message=f"Cloud GPU dispatch failed ({hint}): {exc}",
                         status_code=502,
-                    )
+                    ) from exc
 
         # Fallback: Zero-Heat Local Deterministic 3D Fusion (CPU, no PyTorch)
         report, ply_bytes, masked_pngs, telemetry = _offline_zero_heat_fusion(
@@ -488,5 +428,8 @@ class CVPipelineService:
             "geometry_report": report.model_dump(),
             "ply_url": ply_url,
             "masked_urls": masked_urls,
-            "telemetry": telemetry,
+            "telemetry": {
+                **telemetry,
+                "active_models": detect_active_pipeline_engines(execution_mode="zero_heat_dev_fallback"),
+            },
         }
