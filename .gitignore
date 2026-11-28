@@ -54,6 +54,8 @@ storage/cad_exports/*
 !storage/cad_exports/.gitkeep
 storage/*.db
 storage/*.sqlite
+storage/checkpoints.json
+storage/checkpoints.json.*.tmp
 
 # IDE & OS
 .vscode/

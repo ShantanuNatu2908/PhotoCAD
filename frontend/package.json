@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "typecheck": "tsc -b",
+    "test": "vitest",
     "lint": "oxlint",
     "preview": "vite preview"
   },
@@ -31,6 +33,7 @@
     "postcss": "^8.5.33",
     "tailwindcss": "^4.3.5",
     "typescript": "~7.0.2",
-    "vite": "^8.3.6"
+    "vite": "^8.3.6",
+    "vitest": "^5.1.2"
   }
 }
