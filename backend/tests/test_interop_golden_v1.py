@@ -14,17 +14,15 @@ from __future__ import annotations
 
 import asyncio
 import math
-from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from langgraph.checkpoint.memory import MemorySaver
 
 from app.agents.graph import run_photocad_langgraph
 from app.cad.interop_verifier import InteropVerifier
 from app.main import app
 from app.schemas.adt import DetectedCylinder, Open3DGeometryReport
-from langgraph.checkpoint.memory import MemorySaver
-
 
 client = TestClient(app)
 

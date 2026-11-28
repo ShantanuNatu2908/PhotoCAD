@@ -1,8 +1,11 @@
 import uuid
 from datetime import datetime, timezone
-from sqlalchemy import Column, String, Integer, Float, DateTime, ForeignKey, Text, JSON
+
+from sqlalchemy import JSON, Column, DateTime, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import relationship
+
 from app.core.database import Base
+
 
 def generate_uuid() -> str:
     return str(uuid.uuid4())
@@ -14,6 +17,7 @@ class Project(Base):
     __tablename__ = "projects"
 
     id = Column(String(36), primary_key=True, default=generate_uuid)
+    tenant_id = Column(String(64), nullable=False, default="public", index=True)
     name = Column(String(128), nullable=False)
     description = Column(Text, nullable=True)
     unit = Column(String(16), default="mm")  # "mm" or "inch"
@@ -29,6 +33,7 @@ class ScanSession(Base):
 
     id = Column(String(36), primary_key=True, default=generate_uuid)
     project_id = Column(String(36), ForeignKey("projects.id"), nullable=False)
+    tenant_id = Column(String(64), nullable=False, default="public", index=True)
     status = Column(String(32), default="capturing")  # capturing, calibrated, processing_cv, fused, failed
     has_scale_reference = Column(Integer, default=0) # 1 if ArUco or calibrated marker present
     scale_px_to_mm = Column(Float, default=1.0)
@@ -51,6 +56,7 @@ class CadGeneration(Base):
 
     id = Column(String(36), primary_key=True, default=generate_uuid)
     scan_session_id = Column(String(36), ForeignKey("scan_sessions.id"), nullable=False)
+    tenant_id = Column(String(64), nullable=False, default="public", index=True)
     version = Column(Integer, default=1)
     status = Column(String(32), default="pending")  # pending, generating, compiling, completed, failed
     

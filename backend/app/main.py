@@ -1,24 +1,28 @@
-import os
 from contextlib import asynccontextmanager
 from typing import Dict, List
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from app.core.config import settings
-from app.core.database import init_db
-from app.core.cloud_config import CloudHealthService
+from app.api.routes_export import router as export_router
+from app.api.routes_generate import router as generate_router
 from app.api.routes_projects import router as projects_router
 from app.api.routes_scans import router as scans_router
-from app.api.routes_generate import router as generate_router
-from app.api.routes_export import router as export_router
+from app.core.cloud_config import CloudHealthService
+from app.core.config import settings
+from app.core.database import AsyncSessionLocal, init_db
+from app.core.security import authenticate_websocket
+from app.core.tenancy import find_owned
+from app.models.db_models import CadGeneration, ScanSession
+
 
 # WebSocket Connection Manager for Real-time Multi-Agent Log Streaming
 class ConnectionManager:
-    def __init__(self):
+    def __init__(self) -> None:
         self.active_connections: Dict[str, List[WebSocket]] = {}
 
-    async def connect(self, generation_id: str, websocket: WebSocket):
+    async def connect(self, generation_id: str, websocket: WebSocket) -> None:
         await websocket.accept()
         if generation_id not in self.active_connections:
             self.active_connections[generation_id] = []
@@ -30,7 +34,7 @@ class ConnectionManager:
             if not self.active_connections[generation_id]:
                 del self.active_connections[generation_id]
 
-    async def broadcast_to_generation(self, generation_id: str, message: dict):
+    async def broadcast_to_generation(self, generation_id: str, message: dict) -> None:
         if generation_id in self.active_connections:
             for connection in self.active_connections[generation_id]:
                 try:
@@ -65,17 +69,18 @@ app.add_middleware(
 # Mount storage directory for static access (uploaded images, edge maps, STL files)
 app.mount("/storage", StaticFiles(directory=str(settings.STORAGE_DIR)), name="storage")
 
-# Include API Routers (primary /api plus /api/v1 alias per PCAD-API-ADT-003)
-app.include_router(projects_router, prefix=settings.API_V1_PREFIX)
-app.include_router(scans_router, prefix=settings.API_V1_PREFIX)
-app.include_router(generate_router, prefix=settings.API_V1_PREFIX)
-app.include_router(export_router, prefix=settings.API_V1_PREFIX)
+# Include API Routers under both /api and /api/v1 regardless of .env API_V1_PREFIX
+_mount_prefixes = []
+for _p in ("/api", "/api/v1", settings.API_V1_PREFIX.rstrip("/")):
+    if _p and _p not in _mount_prefixes:
+        _mount_prefixes.append(_p)
 
-if settings.API_V1_PREFIX != "/api/v1":
-    app.include_router(projects_router, prefix="/api/v1", include_in_schema=False)
-    app.include_router(scans_router, prefix="/api/v1", include_in_schema=False)
-    app.include_router(generate_router, prefix="/api/v1", include_in_schema=False)
-    app.include_router(export_router, prefix="/api/v1", include_in_schema=False)
+for _idx, _prefix in enumerate(_mount_prefixes):
+    _in_schema = _idx == 0
+    app.include_router(projects_router, prefix=_prefix, include_in_schema=_in_schema)
+    app.include_router(scans_router, prefix=_prefix, include_in_schema=_in_schema)
+    app.include_router(generate_router, prefix=_prefix, include_in_schema=_in_schema)
+    app.include_router(export_router, prefix=_prefix, include_in_schema=_in_schema)
 
 
 async def broadcast_scan_event(scan_id: str, message: dict) -> None:
@@ -83,8 +88,20 @@ async def broadcast_scan_event(scan_id: str, message: dict) -> None:
     await ws_manager.broadcast_to_generation(f"scan:{scan_id}", message)
 
 
+async def _authorize_ws_resource(websocket: WebSocket, model, resource_id: str) -> str:
+    """Authenticates the handshake and rejects channels owned by another tenant."""
+    tenant = await authenticate_websocket(websocket)
+    async with AsyncSessionLocal() as db:
+        resource = await find_owned(db, model, resource_id)
+    if resource is None:
+        await websocket.close(code=1008, reason="Resource not found")
+        raise WebSocketDisconnect(code=1008)
+    return tenant
+
+
 @app.websocket("/ws/agent-logs/{generation_id}")
 async def websocket_agent_logs(websocket: WebSocket, generation_id: str):
+    await _authorize_ws_resource(websocket, CadGeneration, generation_id)
     await ws_manager.connect(generation_id, websocket)
     try:
         while True:
@@ -97,6 +114,7 @@ async def websocket_agent_logs(websocket: WebSocket, generation_id: str):
 @app.websocket("/ws/v1/scans/{scan_id}")
 async def websocket_scan_events(websocket: WebSocket, scan_id: str):
     """Real-time CV segmentation, fusion, and CAD synthesis event stream (PCAD-API-ADT-003)."""
+    await _authorize_ws_resource(websocket, ScanSession, scan_id)
     channel_key = f"scan:{scan_id}"
     await ws_manager.connect(channel_key, websocket)
     try:
@@ -114,7 +132,8 @@ async def health_check():
     }
 
 @app.get("/health/cloud")
-@app.get(f"{settings.API_V1_PREFIX}/health/cloud")
+@app.get("/api/health/cloud")
+@app.get("/api/v1/health/cloud")
 async def cloud_health_diagnostics():
     """Returns connection diagnostics across the 4 managed cloud tiers."""
     return await CloudHealthService.get_full_diagnostics()

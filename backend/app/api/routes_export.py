@@ -1,14 +1,15 @@
-import os
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.database import get_db
-from app.core.config import settings
-from app.models.db_models import CadGeneration
 from app.cad.interop_verifier import InteropVerifier
+from app.core.config import settings
+from app.core.database import get_db
+from app.core.security import get_current_tenant
+from app.core.tenancy import get_owned
+from app.models.db_models import CadGeneration
 
-router = APIRouter(prefix="/export", tags=["Export"])
+router = APIRouter(prefix="/export", tags=["Export"], dependencies=[Depends(get_current_tenant)])
 
 
 @router.get("/{generation_id}/interop-report")
@@ -20,7 +21,7 @@ async def get_cad_interoperability_report(
     Runs AutoCAD, Fusion 360, and SolidWorks structural & 1:1 mm compatibility verification
     against exported .STEP, .DXF, and .STL files for a completed CAD generation.
     """
-    gen = await db.get(CadGeneration, generation_id)
+    gen = await get_owned(db, CadGeneration, generation_id, detail="CAD Generation not found")
     if not gen:
         raise HTTPException(status_code=404, detail="CAD Generation not found")
 
@@ -47,7 +48,7 @@ async def download_cad_file(
     - `stl`: Stereolithography mesh (3D Printing / Slicing)
     - `dxf`: 2D AutoCAD Drawing Exchange Format
     """
-    gen = await db.get(CadGeneration, generation_id)
+    gen = await get_owned(db, CadGeneration, generation_id, detail="CAD Generation not found")
     if not gen:
         raise HTTPException(status_code=404, detail="CAD Generation not found")
 

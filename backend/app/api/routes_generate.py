@@ -1,13 +1,17 @@
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from typing import Any, Dict, Optional, cast
+
+from fastapi import APIRouter, BackgroundTasks, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 
-from app.core.database import get_db, AsyncSessionLocal
-from app.models.db_models import ScanSession, CadGeneration, AgentLog
-from app.schemas.cad_schemas import GenerationTriggerRequest, CadGenerationResponse
+from app.core.database import AsyncSessionLocal, get_db
+from app.core.security import get_current_tenant
+from app.core.tenancy import apply_tenant, get_owned, scoped
+from app.models.db_models import AgentLog, CadGeneration, ScanSession
+from app.schemas.cad_schemas import CadGenerationResponse, GenerationTriggerRequest
 from app.services.agents.orchestrator import AgentOrchestrator
 
-router = APIRouter(prefix="/generate", tags=["Generation"])
+router = APIRouter(prefix="/generate", tags=["Generation"], dependencies=[Depends(get_current_tenant)])
 
 async def run_pipeline_task(
     generation_id: str,
@@ -30,11 +34,11 @@ async def run_pipeline_task(
         orchestrator = AgentOrchestrator(db=db, ws_broadcast=ws_cb)
         await orchestrator.run_pipeline(
             generation_id=generation_id,
-            views_data=session.views_data or {},
-            scale_ratio=session.scale_px_to_mm or 1.0,
+            views_data=cast(Dict[str, Any], session.views_data or {}),
+            scale_ratio=cast(float, session.scale_px_to_mm or 1.0),
             engine_type=engine_type,
-            scan_session_id=session.id,
-            geometry_report_json=session.geometry_report_json,
+            scan_session_id=cast(Optional[str], session.id),
+            geometry_report_json=cast(Optional[Dict[str, Any]], session.geometry_report_json),
             refinement_prompt=refinement_prompt,
         )
 
@@ -45,23 +49,22 @@ async def trigger_cad_generation(
     background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ):
-    session = await db.get(ScanSession, req.scan_session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Scan session not found")
+    await get_owned(db, ScanSession, req.scan_session_id, detail="Scan session not found")
 
-    result = await db.execute(
+    result = await db.execute(scoped(
         select(CadGeneration)
         .where(CadGeneration.scan_session_id == req.scan_session_id)
-        .order_by(CadGeneration.version.desc())
-    )
+        .order_by(CadGeneration.version.desc()),
+        CadGeneration,
+    ))
     latest = result.scalars().first()
     new_version = (latest.version + 1) if latest else 1
 
-    generation = CadGeneration(
+    generation = apply_tenant(CadGeneration(
         scan_session_id=req.scan_session_id,
         version=new_version,
         status="pending",
-    )
+    ))
     db.add(generation)
     await db.commit()
     await db.refresh(generation)
@@ -92,15 +95,14 @@ async def trigger_cad_generation(
 
 @router.get("/{generation_id}", response_model=CadGenerationResponse)
 async def get_generation_status(generation_id: str, db: AsyncSession = Depends(get_db)):
-    generation = await db.get(CadGeneration, generation_id)
-    if not generation:
-        raise HTTPException(status_code=404, detail="Generation not found")
+    generation = await get_owned(db, CadGeneration, generation_id, detail="Generation not found")
 
-    log_results = await db.execute(
+    log_results = await db.execute(scoped(
         select(AgentLog)
         .where(AgentLog.generation_id == generation_id)
-        .order_by(AgentLog.created_at.asc())
-    )
+        .order_by(AgentLog.created_at.asc()),
+        AgentLog,
+    ))
     logs = list(log_results.scalars().all())
     return CadGenerationResponse(
         id=generation.id,

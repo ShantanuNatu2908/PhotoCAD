@@ -1,20 +1,28 @@
 import os
 import uuid
-from typing import Optional, Dict, Any
-from fastapi import APIRouter, Depends, HTTPException, Request
+from typing import Any, Dict, Optional
+
+from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.database import get_db
+from app.core.cloud_auth import (
+    detect_active_pipeline_engines,
+    is_modal_configured,
+    is_valid_secret,
+)
 from app.core.config import settings
+from app.core.database import get_db
+from app.core.security import get_current_tenant
+from app.core.tenancy import apply_tenant, find_owned, get_owned, scoped
 from app.models.db_models import AgentLog, CadGeneration, Project, ScanSession
-from app.schemas.cad_schemas import ScanSessionResponse
 from app.schemas.adt import CalibrationSpec, CaptureSide
+from app.schemas.cad_schemas import ScanSessionResponse
+from app.services.cv_pipeline_service import CVPipelineError, CVPipelineService
 from app.services.r2_storage import r2_storage
-from app.services.cv_pipeline_service import CVPipelineService, CVPipelineError
 
-router = APIRouter(prefix="/scans", tags=["Scans"])
+router = APIRouter(prefix="/scans", tags=["Scans"], dependencies=[Depends(get_current_tenant)])
 
 # Request / Response Schemas for v1 endpoints per PCAD-API-ADT-003
 class ScanCreateRequest(BaseModel):
@@ -32,6 +40,73 @@ class ViewConfirmRequest(BaseModel):
     width_px: int = Field(default=1920, ge=1)
     height_px: int = Field(default=1080, ge=1)
     image_url: Optional[str] = None
+    manual_override: bool = False
+
+
+@router.get("")
+async def list_scan_sessions(db: AsyncSession = Depends(get_db)):
+    """Lists all saved scan sessions and their latest CAD generation summary for the Projects & Scans dashboard."""
+    from sqlalchemy.future import select
+
+    scans_res = await db.execute(scoped(
+        select(ScanSession).order_by(ScanSession.created_at.desc()), ScanSession
+    ))
+    scans = list(scans_res.scalars().all())
+    proj_res = await db.execute(scoped(select(Project), Project))
+    proj_map = {p.id: p for p in proj_res.scalars().all()}
+    gen_res = await db.execute(scoped(
+        select(CadGeneration).order_by(CadGeneration.version.desc()), CadGeneration
+    ))
+    latest_gen_map: Dict[str, CadGeneration] = {}
+    for g in gen_res.scalars().all():
+        if g.scan_session_id not in latest_gen_map:
+            latest_gen_map[g.scan_session_id] = g
+
+    items = []
+    for s in scans:
+        views = s.views_data or {}
+        confirmed_sides = [
+            side.value
+            for side in CaptureSide
+            if isinstance(views.get(side.value), dict) and views[side.value].get("status") == "confirmed"
+        ]
+        thumb_url = None
+        for side in ("front", "left", "top", "right", "back", "bottom"):
+            if isinstance(views.get(side), dict) and views[side].get("image_url"):
+                thumb_url = views[side].get("masked_url") or views[side].get("image_url")
+                break
+        proj = proj_map.get(s.project_id)
+        lg = latest_gen_map.get(s.id)
+        items.append({
+            "scan_id": s.id,
+            "project_id": s.project_id,
+            "project_name": proj.name if proj else "PhotoCAD Scan",
+            "status": s.status,
+            "confirmed_sides": confirmed_sides,
+            "views_count": len(confirmed_sides),
+            "ply_url": s.ply_file,
+            "thumbnail_url": thumb_url,
+            "geometry_report": s.geometry_report_json,
+            "calibration": s.calibration_json,
+            "created_at": s.created_at.isoformat() if s.created_at else None,
+            "latest_generation": (
+                {
+                    "id": lg.id,
+                    "scan_session_id": lg.scan_session_id,
+                    "version": lg.version,
+                    "status": lg.status,
+                    "code": lg.code,
+                    "step_file": lg.step_file,
+                    "stl_file": lg.stl_file,
+                    "dxf_file": lg.dxf_file,
+                    "dimensions_mm": lg.dimensions_mm,
+                    "created_at": lg.created_at.isoformat() if lg.created_at else None,
+                }
+                if lg
+                else None
+            ),
+        })
+    return items
 
 class ViewConfirmResponse(BaseModel):
     scan_id: str
@@ -52,10 +127,10 @@ async def create_scan_session(
     Creates a new scan session and issues pre-signed upload URLs for all 6 perspectives.
     Document ID: PCAD-API-ADT-003 Section 2.
     """
-    project = await db.get(Project, payload.project_id)
+    project = await find_owned(db, Project, payload.project_id)
     if not project:
         # Auto-create fallback project if not found in dev mode
-        project = Project(id=payload.project_id, name=payload.title, unit="mm")
+        project = apply_tenant(Project(id=payload.project_id, name=payload.title, unit="mm"))
         db.add(project)
         await db.commit()
 
@@ -74,14 +149,14 @@ async def create_scan_session(
         for side in CaptureSide
     }
 
-    scan_session = ScanSession(
+    scan_session = apply_tenant(ScanSession(
         id=scan_id,
         project_id=project.id,
         status="capturing",
         has_scale_reference=0,
         scale_px_to_mm=1.0,
         views_data={side.value: {"status": "pending"} for side in CaptureSide}
-    )
+    ))
     db.add(scan_session)
     await db.commit()
 
@@ -104,7 +179,7 @@ async def upload_raw_keyframe_bytes(
     Dev-mode direct binary PUT endpoint mirroring Cloudflare R2 pre-signed PUT uploads.
     Persists raw uncompressed .PNG bytes under storage/uploads/{scan_id}/{side}.png.
     """
-    session = await db.get(ScanSession, scan_id)
+    session = await get_owned(db, ScanSession, scan_id, detail="Scan session not found")
     if not session:
         raise HTTPException(status_code=404, detail="Scan session not found")
 
@@ -139,7 +214,7 @@ async def confirm_view_keyframe(
     Confirms uncompressed PNG upload for an individual perspective with client-side blur score.
     Document ID: PCAD-API-ADT-003 (FR-03 & FR-04).
     """
-    session = await db.get(ScanSession, scan_id)
+    session = await get_owned(db, ScanSession, scan_id, detail="Scan session not found")
     if not session:
         raise HTTPException(status_code=404, detail="Scan session not found")
 
@@ -148,7 +223,7 @@ async def confirm_view_keyframe(
     if side_lower not in valid_sides:
         raise HTTPException(status_code=400, detail=f"Invalid capture side '{side}'. Must be one of {valid_sides}")
 
-    is_sharp = payload.blur_score >= 120.0
+    is_sharp = bool(payload.manual_override or payload.blur_score >= 120.0)
     view_status = "confirmed" if is_sharp else "rejected_blur"
 
     views = dict(session.views_data or {})
@@ -189,7 +264,7 @@ async def calibrate_metric_scale(
     Locks in 1:1 mm metric scale using 2-point caliper input or reference token.
     Document ID: PCAD-PRD-SRS-001 (FR-06) & PCAD-API-ADT-003.
     """
-    session = await db.get(ScanSession, scan_id)
+    session = await get_owned(db, ScanSession, scan_id, detail="Scan session not found")
     if not session:
         raise HTTPException(status_code=404, detail="Scan session not found")
 
@@ -226,17 +301,21 @@ async def calibrate_metric_scale(
     }
 
 
+class StrictCloudOptions(BaseModel):
+    strict_cloud: bool = False
+
+
 @router.post("/{scan_id}/fuse")
 async def trigger_cv_3d_fusion(
     scan_id: str,
+    payload: Optional[StrictCloudOptions] = Body(default=None),
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Phase 3 Entrypoint: Executes SAM 2.1 Masking -> Depth Anything -> Open3D 6-Side Fusion
-    (via Modal L4 GPU when configured or Zero-Heat fallback in local dev) and persists
-    the metric-scaled .PLY point cloud and Open3DGeometryReport ADT.
+    Phase 3 Entrypoint: Executes SAM 2.1 Masking -> Depth Anything -> Open3D Multi-View Fusion
+    (via Modal L4 GPU when configured or Zero-Heat visual hull fallback in local dev).
     """
-    session = await db.get(ScanSession, scan_id)
+    session = await get_owned(db, ScanSession, scan_id, detail="Scan session not found")
     if not session:
         raise HTTPException(status_code=404, detail="Scan session not found")
 
@@ -255,6 +334,7 @@ async def trigger_cv_3d_fusion(
             has_scale_reference=bool(session.has_scale_reference),
             calibration_spec=session.calibration_json,
             ws_broadcast=ws_cb,
+            strict_cloud=bool(payload and payload.strict_cloud),
         )
     except CVPipelineError as exc:
         session.status = "failed"
@@ -292,6 +372,7 @@ async def trigger_cv_3d_fusion(
         "masked_urls": result["masked_urls"],
         "geometry_report": result["geometry_report"],
         "telemetry": result["telemetry"],
+        "active_models": (result.get("telemetry") or {}).get("active_models") or detect_active_pipeline_engines(),
     }
 
 
@@ -301,7 +382,7 @@ async def get_scan_geometry_report(
     db: AsyncSession = Depends(get_db)
 ):
     """Returns the fused Open3DGeometryReport ADT and downloadable .PLY preview URL."""
-    session = await db.get(ScanSession, scan_id)
+    session = await get_owned(db, ScanSession, scan_id, detail="Scan session not found")
     if not session:
         raise HTTPException(status_code=404, detail="Scan session not found")
 
@@ -347,16 +428,18 @@ async def _run_scan_cad_generation(
 ) -> Dict[str, Any]:
     """Creates a new CadGeneration revision, executes the 5-node LangGraph pipeline, and returns artifacts + metrics."""
     from sqlalchemy.future import select
-    from app.services.agents.orchestrator import AgentOrchestrator
-    from app.main import broadcast_scan_event
 
-    res = await db.execute(
-        select(CadGeneration).where(CadGeneration.scan_session_id == scan_id).order_by(CadGeneration.version.desc())
-    )
+    from app.main import broadcast_scan_event
+    from app.services.agents.orchestrator import AgentOrchestrator
+
+    res = await db.execute(scoped(
+        select(CadGeneration).where(CadGeneration.scan_session_id == scan_id).order_by(CadGeneration.version.desc()),
+        CadGeneration,
+    ))
     latest = res.scalars().first()
     version = (latest.version + 1) if latest else 1
 
-    gen = CadGeneration(scan_session_id=scan_id, version=version, status="pending")
+    gen = apply_tenant(CadGeneration(scan_session_id=scan_id, version=version, status="pending"))
     db.add(gen)
     await db.commit()
     await db.refresh(gen)
@@ -396,6 +479,7 @@ async def _run_scan_cad_generation(
             "py_url": f"/api/export/{updated_gen.id}/py",
         },
         "validation_metrics": getattr(updated_gen, "_latest_validation_metrics", None),
+        "active_models": detect_active_pipeline_engines(),
         "agent_logs": [
             {
                 "id": log.id,
@@ -412,10 +496,26 @@ async def _run_scan_cad_generation(
 @router.post("/{scan_id}/generate")
 async def generate_cad_from_scan(
     scan_id: str,
+    payload: Optional[StrictCloudOptions] = Body(default=None),
     db: AsyncSession = Depends(get_db),
 ):
     """Runs Phase 4 5-Node LangGraph B-Rep Synthesis synchronously or via scan route per PCAD-API-ADT-003."""
-    session = await db.get(ScanSession, scan_id)
+    if payload and payload.strict_cloud:
+        gemini_ok = is_valid_secret(settings.GEMINI_API_KEY or os.getenv("GEMINI_API_KEY", ""))
+        anthropic_ok = is_valid_secret(os.getenv("ANTHROPIC_API_KEY", ""))
+        if not is_modal_configured() or not (gemini_ok or anthropic_ok):
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": {
+                        "code": "CLOUD_HIGH_ACCURACY_NOT_READY",
+                        "message": "Strict Cloud High-Accuracy Mode requires Modal GPU (`modal setup` or tokens) plus GEMINI_API_KEY or ANTHROPIC_API_KEY in `.env`.",
+                        "details": {"active_models": detect_active_pipeline_engines()},
+                    }
+                },
+            )
+
+    session = await get_owned(db, ScanSession, scan_id, detail="Scan session not found")
     if not session:
         raise HTTPException(status_code=404, detail="Scan session not found")
     return await _run_scan_cad_generation(scan_id=scan_id, session=session, db=db)
@@ -430,16 +530,17 @@ async def get_revision_artifacts(
     """Retrieves .STEP, .DXF, .STL, .PLY, and editable build123d .py URLs for a CAD revision."""
     from sqlalchemy.future import select
 
-    session = await db.get(ScanSession, scan_id)
+    session = await get_owned(db, ScanSession, scan_id, detail="Scan session not found")
     if not session:
         raise HTTPException(status_code=404, detail="Scan session not found")
 
-    res = await db.execute(
+    res = await db.execute(scoped(
         select(CadGeneration).where(
             CadGeneration.scan_session_id == scan_id,
             CadGeneration.version == rev,
-        )
-    )
+        ),
+        CadGeneration,
+    ))
     gen = res.scalars().first()
     if not gen:
         raise HTTPException(status_code=404, detail=f"Revision {rev} not found")
@@ -467,7 +568,7 @@ async def refine_cad_revision(
     db: AsyncSession = Depends(get_db),
 ):
     """Resumes the saved LangGraph thread checkpoint to apply parametric edits in <15s (PCAD-LG-004)."""
-    session = await db.get(ScanSession, scan_id)
+    session = await get_owned(db, ScanSession, scan_id, detail="Scan session not found")
     if not session:
         raise HTTPException(status_code=404, detail="Scan session not found")
     return await _run_scan_cad_generation(
@@ -480,7 +581,7 @@ async def refine_cad_revision(
 
 @router.get("/{session_id}", response_model=ScanSessionResponse)
 async def get_scan_session(session_id: str, db: AsyncSession = Depends(get_db)):
-    session = await db.get(ScanSession, session_id)
+    session = await get_owned(db, ScanSession, session_id, detail="Scan session not found")
     if not session:
         raise HTTPException(status_code=404, detail="Scan session not found")
     return session
