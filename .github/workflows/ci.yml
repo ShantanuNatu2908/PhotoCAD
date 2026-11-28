@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Unit tests never receive live Gemini/Anthropic/Modal credentials;
+# backend/tests/conftest.py strips them. No deploy job runs on untrusted events.
+
+jobs:
+  backend:
+    name: Backend — lint, types, tests, schema-sync
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Install backend dependencies
+        run: uv sync --frozen
+      - name: ruff check
+        run: uv run ruff check . ../gpu_workers
+      - name: mypy
+        run: uv run mypy app
+      - name: pytest
+        run: uv run pytest tests/ -q
+      - name: schema-sync
+        run: uv run python scripts/check_schema_sync.py
+
+  frontend:
+    name: Frontend — typecheck, build, unit tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install frontend dependencies
+        run: npm ci
+      - name: typecheck
+        run: npm run typecheck
+      - name: build
+        run: npm run build
+      - name: vitest
+        run: npm test -- --run
+
+  gates:
+    name: Gate ledger
+    needs: [backend, frontend]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install backend dependencies
+        working-directory: backend
+        run: uv sync --frozen
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+      - name: Verify GATES.md
+        run: |
+          node scripts/verify.mjs baseline
+          node scripts/verify.mjs skills
+          node scripts/verify.mjs checkpointer
+          node scripts/verify.mjs rag
+          node scripts/verify.mjs auth
+          node scripts/verify.mjs nurbs
+          node scripts/verify.mjs cicd
+          node scripts/verify.mjs docs
+          node scripts/verify.mjs calibration

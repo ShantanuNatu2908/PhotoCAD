@@ -46,6 +46,25 @@ In the Cloudflare R2 Bucket Dashboard (`photocad-assets`), add an Object Lifecyc
 - **Action:** Delete objects after **1 day (24 hours)**.
 Raw camera frames containing user hands are automatically purged while `.STEP`, `.DXF`, `.STL`, and `.PLY` exports persist.
 
+### Step D: Provision Persistent State & Semantic RAG (v1.1)
+
+1. In Supabase SQL Editor, run the idempotent migrations in order:
+   ```sql
+   -- backend/migrations/001_pgvector_rag.sql
+   -- backend/migrations/002_tenant_columns.sql
+   ```
+   Confirm `vector` is installed (`SELECT extname FROM pg_extension WHERE extname = 'vector'`) and that `photocad_rag_chunks` has an HNSW index.
+2. Set `DATABASE_URL` to the async Supabase connection string. `resolve_checkpointer()` then selects `AsyncPostgresSaver`; if Postgres is unavailable it degrades to `AsyncRedisSaver`, then a durable `FileSaver`, and only then `MemorySaver`. Set `REDIS_URL` to enable the Redis tier.
+3. The RAG service keeps immutable golden chunks as a safe fallback when no vector repository is injected. With `DATABASE_URL` configured, semantic retrieval uses deterministic embeddings plus domain synonyms through `PgVectorRepository`; keyword retrieval remains the last resort.
+4. For authenticated deployments set `JWT_SECRET` (or `SUPABASE_JWT_SECRET`, HS256) and optionally `JWT_ISSUER`. With neither secret set, the API remains in explicit local-developer bypass mode with tenant `public`.
+5. Set `PHOTOCAD_SMOOTH_SURFACES=true` only after consumers accept an `OPEN_SHELL` B-spline representation alongside the authoritative watertight STEP. The flag adds C2 patch metadata to `visual_hull.json` for both Modal and Zero-Heat fusion paths.
+6. Verify the deployment contract locally before shipping:
+   ```bash
+   node scripts/verify.mjs baseline
+   node scripts/verify.mjs cicd
+   node scripts/verify.mjs docs
+   ```
+
 ---
 
 ## 3. AutoCAD, Fusion 360 & SolidWorks Verification Protocol (`NFR-06`)
@@ -66,3 +85,19 @@ Before releasing a build, verify all exported packages pass both automated check
    - **AutoCAD (`IMPORT` command):** Open `.STEP` $\to$ verify `PROPERTIES` reports Solid3D with selectable planar and cylindrical faces; open `.DXF` $\to$ run `UNITS` to confirm `Millimeters` (`4`) and measure bore/length with `DIST`.
    - **Autodesk Fusion 360:** *File $\to$ Open* `.STEP` $\to$ inspect *Measure* tool in `mm` $\to$ verify Push/Pull (`Press Pull`) modifies extruded thickness and hole faces cleanly.
    - **SOLIDWORKS:** *File $\to$ Open* `.STEP` $\to$ run *Evaluate $\to$ Check Entity* (`Solid Body`, 0 invalid faces/edges) $\to$ verify *Mass Properties* matches reported `volume_mm3`.
+
+---
+
+## 4. v1.1 External Handoff Checklist (not claimable from source control)
+
+These steps require account access and dashboard actions; the repository only prepares the code and configuration contracts.
+
+| Owner | Action | Done when |
+| :--- | :--- | :--- |
+| Modal account admin | Add billing/payment method and run `modal deploy gpu_workers/modal_app.py` | `/api/health/cloud` reports the Modal GPU worker ready. |
+| Supabase admin | Create Postgres 16 project, enable `vector`, apply `001_pgvector_rag.sql` and `002_tenant_columns.sql` | HNSW index exists and tenant RLS policies are present. |
+| Redis admin | Provision Redis Cloud / Upstash and set `REDIS_URL` | `resolve_checkpointer()` logs the `AsyncRedisSaver` tier (when Postgres is intentionally disabled). |
+| Cloudflare R2 admin | Create `photocad-assets` bucket and the `uploads/*` 24-hour `lifecycle` expiration rule | Raw keyframes expire after 1 day while export prefixes persist. |
+| CI admin | Protect `main`, add optional deploy secrets, and enable `.github/workflows/ci.yml` | Pull requests run backend, frontend, and gate-ledger jobs without live paid API keys. |
+
+The NURBS path emits opt-in C2 B-spline patches as an open-shell representation; the authoritative watertight STEP body remains the faceted AP214 `CLOSED_SHELL` exporter until a trimmed-patch solid passes interop verification.
