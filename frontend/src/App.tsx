@@ -1,11 +1,14 @@
 import React, { useState, useEffect } from 'react';
 import { Navbar } from './components/Navbar';
-import { SixAxisCapture } from './components/SixAxisCapture';
 import { ScannerChamber } from './components/scanner/ScannerChamber';
-import { CadViewport3D } from './components/CadViewport3D';
-import { AgentTerminal } from './components/AgentTerminal';
+import { GeneratePipelinePage } from './components/pages/GeneratePipelinePage';
+import type { GenerationOptions } from './components/pages/GeneratePipelinePage';
+import { CadOutputPage } from './components/pages/CadOutputPage';
+import { SavedScansPage } from './components/pages/SavedScansPage';
 import { ExportModal } from './components/ExportModal';
 import type {
+  ActivePipelineEngines,
+  AppPage,
   AxisView,
   ViewDetail,
   CadGeneration,
@@ -13,11 +16,13 @@ import type {
   KeyframeCapture,
   CalibrationSpec,
   Open3DGeometryReport,
+  SavedScanItem,
   ScanWsEvent,
   ValidationMetrics,
 } from './types/cad';
 import {
   API_BASE,
+  fetchActiveEngines,
   uploadAndRunCvFusion,
   uploadSingleViewKeyframe,
   generateCadForScan,
@@ -26,9 +31,7 @@ import {
   refineCadRevision,
 } from './services/scanApi';
 import type { ScanGenerateApiResponse } from './services/scanApi';
-import { analyzeAndConvertImageToPng } from './utils/blurDetector';
 import { applyClientDemoRefine } from './utils/cadExport';
-import { Play, Download, Sparkles, RefreshCw, Camera, Grid, Layers, CheckCircle2, Wand2 } from 'lucide-react';
 
 async function generateDemoPngBatch(): Promise<Record<AxisView, KeyframeCapture>> {
   const specs: Record<AxisView, [number, number]> = {
@@ -48,15 +51,11 @@ async function generateDemoPngBatch(): Promise<Record<AxisView, KeyframeCapture>
     canvas.height = h;
     const ctx = canvas.getContext('2d')!;
 
-    // Dark studio surface background
     ctx.fillStyle = '#141923';
     ctx.fillRect(0, 0, w, h);
-
-    // Metallic bracket silhouette
     ctx.fillStyle = '#9db4c8';
     ctx.fillRect(w * 0.18, h * 0.2, w * 0.64, h * 0.6);
 
-    // Center through-hole
     if (side === 'top' || side === 'bottom' || side === 'front') {
       ctx.fillStyle = '#141923';
       ctx.beginPath();
@@ -75,104 +74,81 @@ async function generateDemoPngBatch(): Promise<Record<AxisView, KeyframeCapture>
       width: w,
       height: h,
       timestamp: new Date().toISOString(),
+      source: 'upload',
     };
   }
   return out;
 }
 
 export const App: React.FC = () => {
+  const [activePage, setActivePage] = useState<AppPage>('capture');
   const [unit, setUnit] = useState('mm');
-  const [systemStatus, setSystemStatus] = useState('Ready (SAM2 + Open3D)');
+  const [systemStatus, setSystemStatus] = useState('Ready (Visual Hull + build123d)');
   const [projectId, setProjectId] = useState<string>('demo-proj-001');
+  const [projectName, setProjectName] = useState<string>('Precision Multi-View Scan');
   const [scanSessionId, setScanSessionId] = useState<string | null>(null);
-  const [hasScaleRef, setHasScaleRef] = useState(true);
-  const [scalePxToMm, setScalePxToMm] = useState(1.0);
+
+  const [captures, setCaptures] = useState<Partial<Record<AxisView, KeyframeCapture>>>({});
   const [viewsData, setViewsData] = useState<Partial<Record<AxisView, ViewDetail>>>({});
-  const [capturedKeyframes, setCapturedKeyframes] = useState<Record<AxisView, KeyframeCapture> | null>(null);
   const [calibrationSpec, setCalibrationSpec] = useState<CalibrationSpec | null>(null);
   const [geometryReport, setGeometryReport] = useState<Open3DGeometryReport | null>(null);
   const [plyUrl, setPlyUrl] = useState<string | undefined>(undefined);
-  const [isFusing, setIsFusing] = useState(false);
 
-  const [activeTab, setActiveTab] = useState<'camera' | 'grid'>('camera');
+  const [generationOptions, setGenerationOptions] = useState<GenerationOptions>({
+    reconstructionMode: 'auto_hull',
+    edgeFinish: 'clean',
+    detailLevel: 'standard',
+    strictCloud: false,
+  });
+  const [activeEngines, setActiveEngines] = useState<ActivePipelineEngines | null>(null);
+
+  const [isPipelineRunning, setIsPipelineRunning] = useState(false);
+  const [progressPct, setProgressPct] = useState(0);
+  const [progressStage, setProgressStage] = useState('Idle — Configure scale & options, then click Generate');
+  const [pipelineError, setPipelineError] = useState<string | null>(null);
+
   const [generation, setGeneration] = useState<CadGeneration | null>(null);
   const [agentLogs, setAgentLogs] = useState<AgentLog[]>([]);
   const [activeLangGraphNode, setActiveLangGraphNode] = useState<string | null>(null);
   const [validationMetrics, setValidationMetrics] = useState<ValidationMetrics | null>(null);
   const [refinePrompt, setRefinePrompt] = useState('');
   const [isRefining, setIsRefining] = useState(false);
-  const [isGenerating, setIsGenerating] = useState(false);
   const [showExportModal, setShowExportModal] = useState(false);
 
-  // Initialize or fetch default project
+  // Initialize default project & inspect active AI/GPU engines
   useEffect(() => {
+    void fetchActiveEngines().then((eng) => {
+      if (eng) setActiveEngines(eng);
+    });
     fetch(`${API_BASE}/projects`)
       .then((res) => res.json())
       .then((projects) => {
-        if (projects.length > 0) {
+        if (Array.isArray(projects) && projects.length > 0) {
           setProjectId(projects[0].id);
+          setProjectName(projects[0].name || 'PhotoCAD Scan Workspace');
         } else {
           fetch(`${API_BASE}/projects`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-              name: 'Precision Aluminum Mounting Bracket',
-              description: '6-Axis Orthographic Photogrammetry to B-Rep CAD',
+              name: 'PhotoCAD Multi-View Project',
+              description: 'Multi-axis 3D photometric reverse engineering',
               unit: 'mm',
             }),
           })
-            .then((res) => res.json())
-            .then((p) => setProjectId(p.id))
-            .catch(() => {});
+            .then((r) => r.json())
+            .then((p) => {
+              if (p?.id) {
+                setProjectId(p.id);
+                setProjectName(p.name || 'PhotoCAD Multi-View Project');
+              }
+            });
         }
       })
-      .catch((err) => {
-        console.warn('Backend server not connected yet, operating in demo mode.', err);
+      .catch(() => {
+        // Offline demo capability remains active
       });
   }, []);
-
-  // Poll generation status and agent logs if generation is active
-  const activeGenId = generation?.id;
-  const activeGenStatus = generation?.status;
-
-  useEffect(() => {
-    if (!activeGenId || (activeGenStatus !== 'generating' && activeGenStatus !== 'compiling' && activeGenStatus !== 'pending')) {
-      return;
-    }
-
-    const interval = setInterval(async () => {
-      try {
-        const res = await fetch(`${API_BASE}/generate/${activeGenId}`);
-        if (res.ok) {
-          const updated: CadGeneration = await res.json();
-          setGeneration(updated);
-          if (updated.agent_logs && updated.agent_logs.length > 0) {
-            setAgentLogs((prev) => {
-              const seen = new Set(prev.map((l) => `${l.agent_name}:${l.log_type}:${l.message}`));
-              const merged = [...prev];
-              for (const item of updated.agent_logs || []) {
-                const sig = `${item.agent_name}:${item.log_type}:${item.message}`;
-                if (!seen.has(sig)) {
-                  seen.add(sig);
-                  merged.push(item);
-                }
-              }
-              return merged;
-            });
-          }
-          if (updated.status === 'completed' || updated.status === 'failed') {
-            setIsGenerating(false);
-            setActiveLangGraphNode(null);
-            setSystemStatus(updated.status === 'completed' ? 'Verified .STEP Ready' : 'Synthesis Failed');
-          }
-        }
-      } catch (e) {
-        console.warn('Polling error', e);
-      }
-    }, 1200);
-
-    return () => clearInterval(interval);
-  }, [activeGenId, activeGenStatus]);
 
   const appendLog = (agentName: string, logType: AgentLog['log_type'], message: string) => {
     setAgentLogs((prev) => [
@@ -187,30 +163,72 @@ export const App: React.FC = () => {
     ]);
   };
 
-  // Load High-Fidelity Demo Bracket 6-Axis Scan
-  const handleLoadDemo = () => {
-    const demoSvgBox = (label: string, w: number, h: number, holes = true) => {
-      return `data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">
-        <rect width="100%" height="100%" fill="%231a2333"/>
-        <rect x="20" y="20" width="${w - 40}" height="${h - 40}" rx="15" fill="%232c3e50" stroke="%2300f0ff" stroke-width="3"/>
-        ${holes ? `<circle cx="${w/2}" cy="${h/2}" r="18" fill="%230b0f17" stroke="%23ffb703" stroke-width="2"/>` : ''}
-        <text x="50%" y="35%" dominant-baseline="middle" text-anchor="middle" fill="%23ffffff" font-family="monospace" font-size="14">${label}</text>
-        <text x="50%" y="85%" dominant-baseline="middle" text-anchor="middle" fill="%2300f0ff" font-family="monospace" font-size="11">${w}x${h}mm</text>
-      </svg>`;
-    };
+  // Distinct per-side capture/upload -> uploads individual side right when confirmed
+  const handleSideCaptured = (side: AxisView, capture: KeyframeCapture) => {
+    setCaptures((prev) => ({ ...prev, [side]: capture }));
+    setViewsData((prev) => ({
+      ...prev,
+      [side]: {
+        view: side,
+        image_url: capture.dataUrl,
+        blur_score: capture.blurScore,
+        original_resolution: [capture.width, capture.height],
+        features_detected: 0,
+        primary_dimensions_mm: [80, 50],
+        features: [],
+      },
+    }));
 
-    const demoViews: Record<AxisView, ViewDetail> = {
-      front: { view: 'front', image_url: demoSvgBox('FRONT ELEVATION', 300, 180, true), original_resolution: [300, 180], features_detected: 4, primary_dimensions_mm: [80.0, 30.0], features: [] },
-      back: { view: 'back', image_url: demoSvgBox('REAR ELEVATION', 300, 180, false), original_resolution: [300, 180], features_detected: 2, primary_dimensions_mm: [80.0, 30.0], features: [] },
-      top: { view: 'top', image_url: demoSvgBox('TOP PLAN VIEW', 300, 240, true), original_resolution: [300, 240], features_detected: 6, primary_dimensions_mm: [80.0, 50.0], features: [] },
-      bottom: { view: 'bottom', image_url: demoSvgBox('BASE PLAN VIEW', 300, 240, true), original_resolution: [300, 240], features_detected: 5, primary_dimensions_mm: [80.0, 50.0], features: [] },
-      left: { view: 'left', image_url: demoSvgBox('LEFT PROFILE', 240, 180, false), original_resolution: [240, 180], features_detected: 2, primary_dimensions_mm: [50.0, 30.0], features: [] },
-      right: { view: 'right', image_url: demoSvgBox('RIGHT PROFILE', 240, 180, false), original_resolution: [240, 180], features_detected: 2, primary_dimensions_mm: [50.0, 30.0], features: [] },
-    };
+    void uploadSingleViewKeyframe(projectId, scanSessionId, side, capture)
+      .then((id) => {
+        setScanSessionId(id);
+        appendLog('CaptureClient', 'info', `Uploaded ${side.toUpperCase()} (${capture.width}×${capture.height}, sharpness ${capture.blurScore.toFixed(0)}).`);
+      })
+      .catch(() => {
+        // Offline fallback keeps local blob captures
+      });
+  };
 
-    setViewsData(demoViews);
-    setScalePxToMm(3.75);
-    setScanSessionId('demo-session-882');
+  const handleRemoveSide = (side: AxisView) => {
+    setCaptures((prev) => {
+      const next = { ...prev };
+      delete next[side];
+      return next;
+    });
+    setViewsData((prev) => {
+      const next = { ...prev };
+      delete next[side];
+      return next;
+    });
+  };
+
+  const handleBatchCaptured = (batch: Partial<Record<AxisView, KeyframeCapture>>) => {
+    setCaptures((prev) => ({ ...prev, ...batch }));
+    setViewsData((prev) => {
+      const next = { ...prev };
+      (Object.keys(batch) as AxisView[]).forEach((side) => {
+        const cap = batch[side];
+        if (cap) {
+          next[side] = {
+            view: side,
+            image_url: cap.dataUrl,
+            blur_score: cap.blurScore,
+            original_resolution: [cap.width, cap.height],
+            features_detected: 0,
+            primary_dimensions_mm: [80, 50],
+            features: [],
+          };
+        }
+      });
+      return next;
+    });
+  };
+
+  const handleLoadDemo = async () => {
+    setSystemStatus('Demo Scan Loaded');
+    const demoCaptures = await generateDemoPngBatch();
+    setCaptures(demoCaptures);
+    handleBatchCaptured(demoCaptures);
     setCalibrationSpec({
       mode: 'known_dimension',
       reference_side: 'front',
@@ -219,141 +237,26 @@ export const App: React.FC = () => {
       point_b_px: [262, 100],
       mm_per_unit: 80.0 / 204.0,
     });
-    appendLog('ScannerChamber', 'info', 'Loaded 6-axis demo keyframe set with 80.0mm calibration reference.');
+    setProjectName('Demo Mounting Bracket (80×50×30 mm)');
+    appendLog('CaptureClient', 'success', 'Loaded 6-axis Demo Bracket PNG dataset. Proceed to Page 2 to generate CAD.');
   };
 
-  // Upload photo from Grid tab using Phase 2/3 PNG normalization & binary view upload
-  const handleUploadView = async (view: AxisView, file: File) => {
-    try {
-      const analyzed = await analyzeAndConvertImageToPng(file);
-      const capture: KeyframeCapture = {
-        side: view,
-        blob: analyzed.blob,
-        dataUrl: analyzed.dataUrl,
-        blurScore: analyzed.blurScore,
-        width: analyzed.width,
-        height: analyzed.height,
-        timestamp: new Date().toISOString(),
-      };
-
-      setCapturedKeyframes((prev) => ({
-        ...(prev || ({} as Record<AxisView, KeyframeCapture>)),
-        [view]: capture,
-      }));
-      setViewsData((prev) => ({
-        ...prev,
-        [view]: {
-          view,
-          image_url: capture.dataUrl,
-          blur_score: capture.blurScore,
-          original_resolution: [capture.width, capture.height],
-          features_detected: 4,
-          primary_dimensions_mm: [80.0, 50.0],
-          features: [],
-        },
-      }));
-
-      const activeId = await uploadSingleViewKeyframe(projectId, scanSessionId, view, capture);
-      setScanSessionId(activeId);
-      appendLog('UploadClient', 'info', `Uploaded ${view.toUpperCase()} PNG (${capture.width}×${capture.height}, sharpness ${capture.blurScore.toFixed(0)}).`);
-    } catch (e) {
-      appendLog('UploadClient', 'error', e instanceof Error ? e.message : 'Photo upload failed');
-    }
-  };
-
-  const handleKeyframesCaptured = (
-    captures: Record<AxisView, KeyframeCapture>,
-    calibration?: CalibrationSpec
-  ) => {
-    setCapturedKeyframes(captures);
-    const newViewsData: Partial<Record<AxisView, ViewDetail>> = {};
-    (Object.keys(captures) as AxisView[]).forEach((side) => {
-      const cap = captures[side];
-      newViewsData[side] = {
-        view: side,
-        image_url: cap.dataUrl,
-        blur_score: cap.blurScore,
-        original_resolution: [cap.width, cap.height],
-        features_detected: 4,
-        primary_dimensions_mm: [80.0, 50.0],
-        features: [],
-      };
-    });
-    setViewsData(newViewsData);
-
-    if (calibration) {
-      setCalibrationSpec(calibration);
-      if (calibration.mm_per_unit) {
-        setScalePxToMm(1.0 / calibration.mm_per_unit);
-      }
-    }
-  };
-
-  // Trigger Phase 3: SAM 2.1 + Depth Anything + Open3D 6-Side 3D Fusion
-  const handleRunCvFusion = async () => {
-    setIsFusing(true);
-    setSystemStatus('GPU Vision Fusion...');
-    appendLog('ModalGPUWorker', 'thought', 'Uploading 6 uncompressed PNG keyframes and metric calibration spec...');
-
-    try {
-      const batch = capturedKeyframes || (await generateDemoPngBatch());
-      const calib: CalibrationSpec = calibrationSpec || {
-        mode: 'known_dimension',
-        reference_side: 'front',
-        known_length_mm: 80.0,
-        point_a_px: [58, 100],
-        point_b_px: [262, 100],
-        mm_per_unit: 80.0 / 204.0,
-      };
-
-      const fused = await uploadAndRunCvFusion(projectId, batch, calib, (ev: ScanWsEvent) => {
-        if (ev.event === 'cv_segmentation_started') {
-          appendLog('SAM2Worker', 'info', 'Running BF16 SAM 2.1 hand & background removal across 6 views...');
-        } else if (ev.event === 'cv_fusion_completed') {
-          appendLog('Open3DFusion', 'success', `6-side ICP registration finished (${ev.payload.point_count} pts).`);
-        }
-      });
-
-      setScanSessionId(fused.scan_id);
-      setGeometryReport(fused.geometry_report);
-      setPlyUrl(resolveBackendAssetUrl(fused.ply_url));
-      setSystemStatus('Fused .PLY Ready');
-
-      // Attach SAM masked PNG URLs into viewsData grid
-      setViewsData((prev) => {
-        const next = { ...prev };
-        (Object.keys(fused.masked_urls || {}) as AxisView[]).forEach((side) => {
-          const mUrl = resolveBackendAssetUrl(fused.masked_urls[side]);
-          if (mUrl && next[side]) {
-            next[side] = { ...next[side]!, masked_url: mUrl };
-          }
-        });
-        return next;
-      });
-
-      const bb = fused.geometry_report.bounding_box_mm;
-      appendLog(
-        'Open3DFusion',
-        'success',
-        `Fused [${fused.execution_mode}]: ${fused.geometry_report.point_count} points | ` +
-          `Envelope ${bb[0]}×${bb[1]}×${bb[2]} mm | ICP ${(fused.geometry_report.icp_fitness_score * 100).toFixed(1)}% | ` +
-          `${fused.geometry_report.planes.length} planes, ${fused.geometry_report.cylinders.length} cylinders.`
-      );
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Vision fusion failed';
-      appendLog('Open3DFusion', 'error', msg);
-      setSystemStatus('Fusion Error');
-    } finally {
-      setIsFusing(false);
-    }
-  };
-
-  // Handle live LangGraph WebSocket events streamed from /ws/v1/scans/{scanId}
   const handleScanWsEvent = (ev: ScanWsEvent) => {
     const p = ev.payload || {};
-    if (ev.event === 'agent_node_started') {
+    if (typeof ev.progress_pct === 'number' && ev.progress_pct > 0) {
+      setProgressPct(ev.progress_pct);
+    }
+
+    if (ev.event === 'cv_segmentation_started') {
+      setProgressStage('Isolating foreground silhouettes & removing backgrounds...');
+      appendLog('CVSegmentation', 'info', 'Running GrabCut / SAM foreground segmentation across uploaded views...');
+    } else if (ev.event === 'cv_fusion_completed') {
+      setProgressStage('3D Visual Hull & Point Cloud Fusion complete');
+      appendLog('Open3DFusion', 'success', `3D fusion finished (${String(p.point_count || 0)} surface pts).`);
+    } else if (ev.event === 'agent_node_started') {
       const node = String(p.node || '');
       setActiveLangGraphNode(node);
+      setProgressStage(String(p.message || `Executing ${node}...`));
       const nameMap: Record<string, string> = {
         geometry_analyst: 'VisionAnalyst',
         parametric_architect: 'CSGArchitect',
@@ -381,10 +284,12 @@ export const App: React.FC = () => {
       appendLog(
         'Validator',
         (p as Record<string, unknown>).passed ? 'success' : 'info',
-        `Chamfer ${Number(p.chamfer_mean_mm || 0).toFixed(3)} mm (P95 ${Number(p.chamfer_p95_mm || 0).toFixed(3)} mm) • Watertight=${String(p.is_watertight)}`
+        `Chamfer ${Number(p.chamfer_mean_mm || 0).toFixed(3)} mm • Watertight=${String(p.is_watertight)}`
       );
     } else if (ev.event === 'pipeline_completed') {
       setActiveLangGraphNode(null);
+      setProgressPct(100);
+      setProgressStage('Verified .STEP, .DXF & .STL Ready!');
       setSystemStatus('Verified .STEP Ready');
     }
   };
@@ -405,66 +310,102 @@ export const App: React.FC = () => {
     if (res.validation_metrics) {
       setValidationMetrics(res.validation_metrics);
     }
+    if (res.active_models) {
+      setActiveEngines(res.active_models);
+    }
     if (res.agent_logs && res.agent_logs.length > 0) {
       setAgentLogs(res.agent_logs);
     }
   };
 
-  // Trigger Multi-Agent LangGraph CAD Synthesis
-  const handleSynthesizeCAD = async (): Promise<CadGeneration | null> => {
-    setIsGenerating(true);
-    setSystemStatus('LangGraph Dual-Loop...');
+  // Page 2 -> Runs CV Visual Hull Fusion + LangGraph Synthesis with live progress, then redirects to Page 3
+  const handleRunFullPipeline = async () => {
+    setIsPipelineRunning(true);
+    setPipelineError(null);
+    setProgressPct(10);
+    setProgressStage('Uploading keyframes & isolating 3D silhouettes...');
+    setSystemStatus('Generating 3D CAD...');
 
-    let targetScanId = scanSessionId;
     let unsubscribeWs = () => {};
 
     try {
-      if (!targetScanId || targetScanId.startsWith('demo-')) {
-        const batch = capturedKeyframes || (await generateDemoPngBatch());
-        const calib: CalibrationSpec = calibrationSpec || {
-          mode: 'known_dimension',
-          reference_side: 'front',
-          known_length_mm: 80.0,
-          point_a_px: [58, 100],
-          point_b_px: [262, 100],
-          mm_per_unit: 80.0 / 204.0,
-        };
-        const fused = await uploadAndRunCvFusion(projectId, batch, calib, handleScanWsEvent);
-        targetScanId = fused.scan_id;
-        setScanSessionId(targetScanId);
-        setGeometryReport(fused.geometry_report);
-        setPlyUrl(resolveBackendAssetUrl(fused.ply_url));
+      const batch = Object.keys(captures).length >= 4 ? captures : await generateDemoPngBatch();
+      const calib: CalibrationSpec = calibrationSpec || {
+        mode: 'known_dimension',
+        reference_side: captures.front ? 'front' : 'left',
+        known_length_mm: 180.0,
+      };
+
+      const fused = await uploadAndRunCvFusion(
+        projectId,
+        batch,
+        calib,
+        handleScanWsEvent,
+        scanSessionId,
+        generationOptions.strictCloud
+      );
+      if (fused.active_models) {
+        setActiveEngines(fused.active_models);
+      }
+      const activeScanId = fused.scan_id;
+      setScanSessionId(activeScanId);
+      setGeometryReport(fused.geometry_report);
+      setPlyUrl(resolveBackendAssetUrl(fused.ply_url));
+      setProgressPct(38);
+      setProgressStage('Running LangGraph Multi-Agent B-Rep Synthesis...');
+
+      setViewsData((prev) => {
+        const next = { ...prev };
+        (Object.keys(fused.masked_urls || {}) as AxisView[]).forEach((side) => {
+          const mUrl = resolveBackendAssetUrl(fused.masked_urls[side]);
+          if (mUrl) {
+            next[side] = {
+              ...(next[side] || {
+                view: side,
+                image_url: mUrl,
+                original_resolution: [640, 480],
+                features_detected: 0,
+                primary_dimensions_mm: [80, 50],
+                features: [],
+              }),
+              masked_url: mUrl,
+            };
+          }
+        });
+        return next;
+      });
+
+      unsubscribeWs = subscribeScanEvents(activeScanId, handleScanWsEvent);
+
+      let genRes: ScanGenerateApiResponse;
+      if (generationOptions.edgeFinish === 'chamfer') {
+        await generateCadForScan(activeScanId, generationOptions.strictCloud);
+        genRes = await refineCadRevision(activeScanId, 'Add 1.5 mm chamfer', 1);
+      } else {
+        genRes = await generateCadForScan(activeScanId, generationOptions.strictCloud);
       }
 
-      unsubscribeWs = subscribeScanEvents(targetScanId, handleScanWsEvent);
-
-      const genRes = await generateCadForScan(targetScanId);
       applyScanGenerationResult(genRes);
+      setProgressPct(100);
+      setProgressStage('CAD Synthesis Complete — Opening Fullscreen 3D Output...');
       setSystemStatus(`Rev v${genRes.revision} Verified`);
-      return {
-        id: genRes.generation_id,
-        scan_session_id: genRes.scan_id,
-        version: genRes.revision,
-        status: genRes.status as CadGeneration['status'],
-        code: genRes.code,
-        step_file: genRes.artifacts.step_url,
-        stl_file: genRes.artifacts.stl_url,
-        dxf_file: genRes.artifacts.dxf_url,
-        dimensions_mm: genRes.dimensions_mm,
-        created_at: new Date().toISOString(),
-      };
-    } catch (e) {
-      console.warn('Fallback local agent simulation loop active', e);
-      simulateAgentLoop();
-      return null;
+
+      setTimeout(() => {
+        setActivePage('viewer');
+      }, 650);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Pipeline execution failed';
+      setPipelineError(msg);
+      appendLog('Orchestrator', 'error', msg);
+      setSystemStatus('Generation Failed');
     } finally {
-      setIsGenerating(false);
+      setIsPipelineRunning(false);
       setActiveLangGraphNode(null);
       setTimeout(unsubscribeWs, 1200);
     }
   };
 
-  // Phase 4 Checkpointed Conversational /refine Edit (auto-synthesizes Rev 1 first if needed)
+  // Parametric /refine from Page 3
   const executeRefineInstruction = async (rawInstruction: string) => {
     const instruction = rawInstruction.trim();
     if (!instruction) return;
@@ -473,31 +414,18 @@ export const App: React.FC = () => {
     setSystemStatus('Refining Checkpoint...');
     appendLog('CSGArchitect', 'thought', `Applying parametric edit: "${instruction}"`);
 
-    let activeScanId = scanSessionId;
-    let currentGen = generation;
     let unsub = () => {};
-
     try {
-      if (!activeScanId || activeScanId.startsWith('demo-') || !currentGen || currentGen.id.startsWith('demo-')) {
-        const synthesized = await handleSynthesizeCAD();
-        if (synthesized) {
-          activeScanId = synthesized.scan_session_id;
-          currentGen = synthesized;
-        }
-      }
-
-      if (activeScanId && !activeScanId.startsWith('demo-')) {
-        unsub = subscribeScanEvents(activeScanId, handleScanWsEvent);
-        const updated = await refineCadRevision(activeScanId, instruction, currentGen?.version || 1);
+      if (scanSessionId && !scanSessionId.startsWith('demo-')) {
+        unsub = subscribeScanEvents(scanSessionId, handleScanWsEvent);
+        const updated = await refineCadRevision(scanSessionId, instruction, generation?.version || 1);
         applyScanGenerationResult(updated);
         setRefinePrompt('');
         setSystemStatus(`Rev v${updated.revision} Ready`);
-        appendLog('Validator', 'success', `Revision v${updated.revision} compiled (${updated.dimensions_mm?.x}×${updated.dimensions_mm?.y}×${updated.dimensions_mm?.z} mm).`);
         return;
       }
 
-      // Offline/Demo parametric fallback if FastAPI backend is unreachable
-      const baseGen: CadGeneration = currentGen || {
+      const baseGen: CadGeneration = generation || {
         id: 'demo-gen-001',
         scan_session_id: 'demo-session-882',
         version: 1,
@@ -520,310 +448,154 @@ export const App: React.FC = () => {
     }
   };
 
-  const handleRefineCAD = async (e: React.FormEvent) => {
+  const handleSubmitRefine = async (e: React.FormEvent) => {
     e.preventDefault();
     await executeRefineInstruction(refinePrompt);
   };
 
-  const handleQuickExportClick = async () => {
-    if (generation) {
-      setShowExportModal(true);
-      return;
+  const hydrateSavedScan = (item: SavedScanItem, targetPage: AppPage) => {
+    setScanSessionId(item.scan_id);
+    setProjectId(item.project_id);
+    setProjectName(item.project_name);
+    setGeometryReport(item.geometry_report || null);
+    setCalibrationSpec(item.calibration || null);
+    setPlyUrl(resolveBackendAssetUrl(item.ply_url));
+    setGeneration(item.latest_generation || null);
+
+    const hydratedViews: Partial<Record<AxisView, ViewDetail>> = {};
+    for (const side of item.confirmed_sides) {
+      hydratedViews[side] = {
+        view: side,
+        image_url: resolveBackendAssetUrl(`/storage/uploads/${item.scan_id}/${side}.png`) || '',
+        masked_url: resolveBackendAssetUrl(`/storage/processed_edges/${item.scan_id}/${side}_masked.png`),
+        original_resolution: [640, 480],
+        features_detected: 0,
+        primary_dimensions_mm: [80, 50],
+        features: [],
+      };
     }
-    const generated = await handleSynthesizeCAD();
-    if (generated) {
-      setShowExportModal(true);
-    } else {
-      // Ensure immediate demo generation export opens cleanly even if backend is offline
-      setGeneration({
-        id: 'demo-gen-001',
-        scan_session_id: scanSessionId || 'demo-session-882',
-        version: 1,
-        status: 'completed',
-        dimensions_mm: {
-          x: geometryReport?.bounding_box_mm[0] ?? 80,
-          y: geometryReport?.bounding_box_mm[1] ?? 50,
-          z: geometryReport?.bounding_box_mm[2] ?? 30,
-        },
-        created_at: new Date().toISOString(),
-      });
-      setShowExportModal(true);
-    }
+    setViewsData(hydratedViews);
+    setActivePage(targetPage);
   };
 
-  const simulateAgentLoop = () => {
-    const fakeLogs: AgentLog[] = [
-      { id: '1', agent_name: 'VisionAnalyst', log_type: 'thought', message: 'Scanning all 6 orthogonal perspectives... Aligning Front and Top silhouettes.', created_at: new Date().toISOString() },
-      { id: '2', agent_name: 'VisionAnalyst', log_type: 'info', message: 'Part Classification: Precision Mounting Bracket. Bounding Envelope: 80.0 x 50.0 x 30.0 mm.', created_at: new Date().toISOString() },
-      { id: '3', agent_name: 'CSGArchitect', log_type: 'thought', message: 'Formulating CSG Recipe: Workplane("XY").box(80, 50, 30) -> Fillet Z-edges (r=4.0mm) -> Cut central counterbore hole dia 16mm.', created_at: new Date().toISOString() },
-      { id: '4', agent_name: 'CadCoder', log_type: 'code', message: `import cadquery as cq\n\nresult = (\n    cq.Workplane("XY")\n    .box(80.0, 50.0, 30.0)\n    .edges("|Z")\n    .fillet(4.0)\n    .faces(">Z")\n    .workplane()\n    .hole(16.0)\n)`, created_at: new Date().toISOString() },
-      { id: '5', agent_name: 'Validator', log_type: 'success', message: 'B-Rep Validation Passed: Closed manifold solid confirmed. STEP and STL exported successfully.', created_at: new Date().toISOString() },
-    ];
-
-    let i = 0;
+  const handleStartNewProject = () => {
+    setScanSessionId(null);
+    setCaptures({});
+    setViewsData({});
+    setCalibrationSpec(null);
+    setGeometryReport(null);
+    setPlyUrl(undefined);
+    setGeneration(null);
     setAgentLogs([]);
-    const timer = setInterval(() => {
-      if (i < fakeLogs.length) {
-        setAgentLogs((prev) => [...prev, fakeLogs[i]]);
-        i++;
-      } else {
-        clearInterval(timer);
-        setIsGenerating(false);
-        setGeneration({
-          id: 'demo-gen-001',
-          scan_session_id: 'demo-session-882',
-          version: 1,
-          status: 'completed',
-          dimensions_mm: { x: 80, y: 50, z: 30 },
-          created_at: new Date().toISOString(),
-          code: `import cadquery as cq\n\nresult = (\n    cq.Workplane("XY")\n    .box(80.0, 50.0, 30.0)\n    .edges("|Z")\n    .fillet(4.0)\n    .faces(">Z")\n    .workplane()\n    .hole(16.0)\n)`,
-        });
-      }
-    }, 800);
+    setValidationMetrics(null);
+    setProgressPct(0);
+    setProgressStage('Idle — Capture 4 to 6 sides first');
+    setProjectName('New Multi-View Scan Session');
+    setActivePage('capture');
   };
+
+  const capturedCount = Math.max(
+    Object.keys(captures).length,
+    Object.keys(viewsData).length
+  );
 
   return (
     <div className="min-h-screen bg-[#090d14] cad-grid-bg text-slate-100 flex flex-col">
-      <Navbar unit={unit} setUnit={setUnit} systemStatus={systemStatus} />
+      <Navbar
+        unit={unit}
+        setUnit={setUnit}
+        systemStatus={systemStatus}
+        activePage={activePage}
+        onNavigate={setActivePage}
+        capturedCount={capturedCount}
+        hasGeneration={Boolean(generation)}
+      />
 
-      <main className="flex-1 p-4 lg:p-6 max-w-[1600px] w-full mx-auto space-y-5">
-        {/* Top Action Bar */}
-        <div className="flex flex-wrap items-center justify-between gap-3 bg-cad-card border border-cad-border p-3.5 rounded-xl shadow-lg">
-          <div>
-            <h1 className="text-base font-bold text-white flex items-center space-x-2">
-              <span className="text-cyan-400 font-mono">PROJECT //</span>
-              <span>Precision Aluminum Mounting Bracket</span>
-            </h1>
-            <p className="text-xs text-slate-400">
-              6-Axis Guided Capture → SAM 2.1 + Depth Anything + Open3D Fusion → Parametric ISO 10303-21 STEP
-            </p>
-          </div>
+      <main className="flex-1">
+        {activePage === 'capture' && (
+          <ScannerChamber
+            projectName={projectName}
+            captures={captures}
+            calibrationSpec={calibrationSpec}
+            onSideCaptured={handleSideCaptured}
+            onRemoveSide={handleRemoveSide}
+            onBatchCaptured={handleBatchCaptured}
+            onSaveCalibration={setCalibrationSpec}
+            onLoadDemo={() => void handleLoadDemo()}
+            onProceedToGenerate={() => setActivePage('generate')}
+          />
+        )}
 
-          <div className="flex flex-wrap items-center gap-2.5">
-            {/* Phase 3: Cloud GPU 3D Fusion Trigger */}
-            <button
-              onClick={handleRunCvFusion}
-              disabled={isFusing}
-              className={`flex items-center space-x-2 px-4 py-2.5 rounded-lg font-mono text-xs font-semibold tracking-wider transition border shadow-md ${
-                isFusing
-                  ? 'bg-emerald-900/40 text-emerald-200 border-emerald-700 cursor-not-allowed'
-                  : 'bg-emerald-950/90 hover:bg-emerald-900 text-emerald-300 border-emerald-600/70'
-              }`}
-            >
-              {isFusing ? (
-                <>
-                  <RefreshCw className="w-4 h-4 animate-spin text-emerald-300" />
-                  <span>FUSING 6 VIEWS...</span>
-                </>
-              ) : (
-                <>
-                  <Layers className="w-4 h-4 text-emerald-400" />
-                  <span>FUSE 3D POINT CLOUD</span>
-                </>
-              )}
-            </button>
+        {activePage === 'generate' && (
+          <GeneratePipelinePage
+            projectName={projectName}
+            captures={captures}
+            viewsData={viewsData}
+            calibrationSpec={calibrationSpec}
+            onSaveCalibration={setCalibrationSpec}
+            options={generationOptions}
+            onChangeOptions={setGenerationOptions}
+            activeEngines={activeEngines}
+            isRunning={isPipelineRunning}
+            progressPct={progressPct}
+            progressStage={progressStage}
+            errorMsg={pipelineError}
+            geometryReport={geometryReport}
+            generation={generation}
+            agentLogs={agentLogs}
+            activeNode={activeLangGraphNode}
+            validationMetrics={validationMetrics}
+            onBackToCapture={() => setActivePage('capture')}
+            onRunPipeline={() => void handleRunFullPipeline()}
+            onGoToViewer={() => setActivePage('viewer')}
+          />
+        )}
 
-            <button
-              onClick={handleSynthesizeCAD}
-              disabled={isGenerating}
-              className={`flex items-center space-x-2 px-5 py-2.5 rounded-lg font-mono text-xs font-semibold tracking-wider transition shadow-lg ${
-                isGenerating
-                  ? 'bg-cyan-600/50 text-cyan-200 cursor-not-allowed'
-                  : 'bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-white shadow-cyan-500/20'
-              }`}
-            >
-              {isGenerating ? (
-                <>
-                  <RefreshCw className="w-4 h-4 animate-spin text-white" />
-                  <span>SYNTHESIZING CAD...</span>
-                </>
-              ) : (
-                <>
-                  <Play className="w-4 h-4 fill-white" />
-                  <span>SYNTHESIZE 3D CAD</span>
-                </>
-              )}
-            </button>
+        {activePage === 'viewer' && (
+          <CadOutputPage
+            projectName={projectName}
+            generation={generation}
+            geometryReport={geometryReport}
+            plyUrl={plyUrl}
+            unit={unit}
+            activeEngines={activeEngines}
+            agentLogs={agentLogs}
+            activeNode={activeLangGraphNode}
+            validationMetrics={validationMetrics}
+            refinePrompt={refinePrompt}
+            setRefinePrompt={setRefinePrompt}
+            isRefining={isRefining}
+            onSubmitRefine={handleSubmitRefine}
+            onQuickRefine={(instr) => void executeRefineInstruction(instr)}
+            onOpenExport={() => {
+              if (!generation) {
+                setGeneration({
+                  id: 'demo-gen-001',
+                  scan_session_id: scanSessionId || 'demo-session-882',
+                  version: 1,
+                  status: 'completed',
+                  dimensions_mm: {
+                    x: geometryReport?.bounding_box_mm[0] ?? 80,
+                    y: geometryReport?.bounding_box_mm[1] ?? 50,
+                    z: geometryReport?.bounding_box_mm[2] ?? 30,
+                  },
+                  created_at: new Date().toISOString(),
+                });
+              }
+              setShowExportModal(true);
+            }}
+            onRescan={() => setActivePage('capture')}
+            onBackToGenerate={() => setActivePage('generate')}
+          />
+        )}
 
-            <button
-              onClick={handleQuickExportClick}
-              disabled={isGenerating}
-              className="flex items-center space-x-2 px-4 py-2.5 rounded-lg bg-emerald-950 text-emerald-300 border border-emerald-600/80 hover:bg-emerald-900 disabled:opacity-50 transition font-mono text-xs font-semibold shadow-md"
-            >
-              <Download className="w-4 h-4" />
-              <span>EXPORT AUTOCAD (.STEP / .DXF)</span>
-            </button>
-          </div>
-        </div>
-
-        {/* Workspace Split Layout */}
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
-          {/* Left Column: 6-Axis Scanning Chamber (5 cols) */}
-          <div className="lg:col-span-5 space-y-4">
-            {/* Capture Mode Tabs */}
-            <div className="flex bg-cad-card border border-cad-border rounded-lg p-1 text-xs font-mono">
-              <button
-                onClick={() => setActiveTab('camera')}
-                className={`flex-1 py-1.5 rounded transition flex items-center justify-center space-x-1.5 ${
-                  activeTab === 'camera'
-                    ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 font-semibold'
-                    : 'text-slate-400 hover:text-white'
-                }`}
-              >
-                <Camera className="w-3.5 h-3.5" />
-                <span>Live Camera (Blur Filter)</span>
-              </button>
-              <button
-                onClick={() => setActiveTab('grid')}
-                className={`flex-1 py-1.5 rounded transition flex items-center justify-center space-x-1.5 ${
-                  activeTab === 'grid'
-                    ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 font-semibold'
-                    : 'text-slate-400 hover:text-white'
-                }`}
-              >
-                <Grid className="w-3.5 h-3.5" />
-                <span>6-View Masked Grid</span>
-              </button>
-            </div>
-
-            {activeTab === 'camera' ? (
-              <ScannerChamber
-                onAllKeyframesCaptured={handleKeyframesCaptured}
-                onLoadDemo={handleLoadDemo}
-              />
-            ) : (
-              <SixAxisCapture
-                viewsData={viewsData}
-                onUploadView={handleUploadView}
-                onLoadDemo={handleLoadDemo}
-                hasScaleRef={hasScaleRef}
-                setHasScaleRef={setHasScaleRef}
-                scalePxToMm={scalePxToMm}
-              />
-            )}
-
-            {/* Open3D Primitive & Alignment Report Inspector */}
-            {geometryReport ? (
-              <div className="p-3.5 bg-cad-card border border-emerald-700/60 rounded-xl text-xs font-mono space-y-2 shadow-lg">
-                <div className="flex items-center justify-between text-emerald-300 font-semibold">
-                  <span className="flex items-center gap-1.5">
-                    <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                    Open3D Geometry Report (1:1 mm)
-                  </span>
-                  <span className="text-[11px] bg-emerald-950 px-2 py-0.5 rounded border border-emerald-800">
-                    ICP {(geometryReport.icp_fitness_score * 100).toFixed(0)}%
-                  </span>
-                </div>
-                <div className="grid grid-cols-3 gap-2 text-[11px] text-slate-300 bg-cad-dark/70 p-2 rounded border border-cad-border">
-                  <div>
-                    <span className="text-slate-500 block">BBox ({unit})</span>
-                    <span className="font-bold text-white">
-                      {geometryReport.bounding_box_mm
-                        .map((v) => (unit === 'inch' ? (v / 25.4).toFixed(2) : v.toFixed(1)))
-                        .join('×')}
-                    </span>
-                  </div>
-                  <div>
-                    <span className="text-slate-500 block">Planes / Cyls</span>
-                    <span className="font-bold text-cyan-300">
-                      {geometryReport.planes.length}P / {geometryReport.cylinders.length}C
-                    </span>
-                  </div>
-                  <div>
-                    <span className="text-slate-500 block">Symmetry</span>
-                    <span className="font-bold text-emerald-300">
-                      {geometryReport.symmetry_planes.join(', ') || 'None'}
-                    </span>
-                  </div>
-                </div>
-                {geometryReport.cylinders.length > 0 && (
-                  <div className="text-[11px] text-slate-400">
-                    Detected {geometryReport.cylinders[0].kind}: R={geometryReport.cylinders[0].radius_mm}mm, Depth={geometryReport.cylinders[0].depth_mm}mm
-                  </div>
-                )}
-              </div>
-            ) : (
-              <div className="p-3 bg-cad-card/60 border border-cad-border/70 rounded-xl text-xs space-y-1.5 text-slate-400 font-mono">
-                <div className="flex items-center space-x-1.5 text-cyan-400 font-semibold">
-                  <Sparkles className="w-3.5 h-3.5" />
-                  <span>Phase 3 GPU Vision Protocol</span>
-                </div>
-                <p className="text-[11px] leading-relaxed">
-                  Capture 6 crisp keyframes and click <strong>FUSE 3D POINT CLOUD</strong> to strip hands via SAM 2.1, estimate depth, align views in Open3D, and inspect the 1:1 mm .PLY scan.
-                </p>
-              </div>
-            )}
-          </div>
-
-          {/* Right Column: 3D CAD Viewport, /refine Studio Bar & Multi-Agent Terminal (7 cols) */}
-          <div className="lg:col-span-7 flex flex-col space-y-3.5">
-            <div className="h-[365px] w-full">
-              <CadViewport3D
-                stlUrl={generation?.stl_file ? `http://localhost:8000${generation.stl_file}` : undefined}
-                plyUrl={plyUrl}
-                geometryReport={geometryReport}
-                dimensions={generation?.dimensions_mm}
-                unit={unit}
-                onExportClick={handleQuickExportClick}
-              />
-            </div>
-
-            {/* Always-Visible Parametric /refine Bar + Quick Presets */}
-            <form
-              onSubmit={handleRefineCAD}
-              className="bg-cad-card border border-cyan-800/70 p-2.5 rounded-xl shadow-md space-y-2"
-            >
-              <div className="flex items-center gap-2">
-                <Wand2 className="w-4 h-4 text-cyan-400 shrink-0 ml-1" />
-                <input
-                  type="text"
-                  value={refinePrompt}
-                  onChange={(e) => setRefinePrompt(e.target.value)}
-                  placeholder='Parametric /refine (e.g. "Change hole to 14 mm", "100x60x25", "Remove hole")'
-                  className="flex-1 bg-transparent text-xs font-mono text-white placeholder-slate-500 focus:outline-none"
-                />
-                <span className="hidden sm:inline text-[10px] font-mono px-2 py-0.5 rounded bg-slate-900 border border-cad-border text-cyan-300">
-                  Rev v{generation?.version ?? 1}
-                </span>
-                <button
-                  type="submit"
-                  disabled={isRefining || !refinePrompt.trim()}
-                  className="px-3.5 py-1.5 rounded-lg bg-cyan-600 hover:bg-cyan-500 disabled:opacity-40 text-white font-mono text-xs font-semibold transition"
-                >
-                  {isRefining ? 'Refining...' : 'Apply /refine'}
-                </button>
-              </div>
-              <div className="flex flex-wrap items-center gap-1.5 pl-1">
-                <span className="text-[10px] font-mono text-slate-500">Quick edits:</span>
-                {[
-                  { label: 'Hole 14mm', instr: 'Change hole diameter to 14 mm' },
-                  { label: '100×60×25 mm', instr: '100x60x25' },
-                  { label: 'Chamfer 2mm', instr: 'Add 2 mm chamfer' },
-                  { label: 'Remove Hole', instr: 'Remove center hole' },
-                ].map((preset) => (
-                  <button
-                    key={preset.label}
-                    type="button"
-                    disabled={isRefining}
-                    onClick={() => executeRefineInstruction(preset.instr)}
-                    className="px-2 py-0.5 rounded bg-slate-900/90 hover:bg-cyan-950 border border-cad-border hover:border-cyan-700 text-[10px] font-mono text-slate-300 hover:text-cyan-300 transition disabled:opacity-40"
-                  >
-                    {preset.label}
-                  </button>
-                ))}
-              </div>
-            </form>
-
-            <div className="h-[245px] w-full">
-              <AgentTerminal
-                logs={agentLogs}
-                status={generation?.status || (isFusing || isGenerating || isRefining ? 'generating' : 'idle')}
-                activeNode={activeLangGraphNode}
-                validationMetrics={validationMetrics}
-              />
-            </div>
-          </div>
-        </div>
+        {activePage === 'projects' && (
+          <SavedScansPage
+            onOpenViewerForScan={(item) => hydrateSavedScan(item, 'viewer')}
+            onOpenGenerateForScan={(item) => hydrateSavedScan(item, 'generate')}
+            onStartNewProject={handleStartNewProject}
+          />
+        )}
       </main>
 
       {showExportModal && generation && (

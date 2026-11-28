@@ -10,6 +10,8 @@ import {
   Video,
   VideoOff,
   AlertCircle,
+  ArrowRight,
+  Timer,
 } from 'lucide-react';
 import {
   computeLaplacianVariance,
@@ -21,27 +23,40 @@ import { ScaleCalibrator } from './ScaleCalibrator';
 import type { AxisView, KeyframeCapture, CalibrationSpec } from '../../types/cad';
 
 interface ScannerChamberProps {
-  onAllKeyframesCaptured: (captures: Record<AxisView, KeyframeCapture>, calibration?: CalibrationSpec) => void;
+  projectName: string;
+  captures: Partial<Record<AxisView, KeyframeCapture>>;
+  calibrationSpec: CalibrationSpec | null;
+  onSideCaptured: (side: AxisView, capture: KeyframeCapture) => void;
+  onRemoveSide: (side: AxisView) => void;
+  onBatchCaptured: (captures: Partial<Record<AxisView, KeyframeCapture>>) => void;
+  onSaveCalibration: (spec: CalibrationSpec) => void;
   onLoadDemo: () => void;
+  onProceedToGenerate: () => void;
 }
 
 const AXIS_SEQUENCE: Array<{ key: AxisView; label: string; axis: string; desc: string }> = [
-  { key: 'front', label: 'FRONT (+Y)', axis: 'Front Elevation', desc: 'Face primary mechanical features directly' },
-  { key: 'back', label: 'BACK (-Y)', axis: 'Rear Elevation', desc: 'Opposing rear face' },
-  { key: 'left', label: 'LEFT (-X)', axis: 'Left Profile', desc: 'Left cross-section' },
-  { key: 'right', label: 'RIGHT (+X)', axis: 'Right Profile', desc: 'Right cross-section' },
-  { key: 'top', label: 'TOP (+Z)', axis: 'Plan View', desc: 'Top view with mounting holes/bores' },
-  { key: 'bottom', label: 'BOTTOM (-Z)', axis: 'Base Datum', desc: 'Base surface and bottom cutouts' },
+  { key: 'front', label: 'FRONT (+Y)', axis: 'Front View', desc: 'Align primary front face toward camera' },
+  { key: 'back', label: 'BACK (-Y)', axis: 'Rear View', desc: 'Rotate 180° to show rear elevation' },
+  { key: 'left', label: 'LEFT (-X)', axis: 'Left Profile', desc: 'Rotate 90° to left side profile' },
+  { key: 'right', label: 'RIGHT (+X)', axis: 'Right Profile', desc: 'Rotate to right side profile' },
+  { key: 'top', label: 'TOP (+Z)', axis: 'Overhead Plan', desc: 'Shoot overhead top silhouette' },
+  { key: 'bottom', label: 'BOTTOM (-Z)', axis: 'Base (Optional)', desc: 'Shoot underside or skip for flat bases' },
 ];
 
 export const ScannerChamber: React.FC<ScannerChamberProps> = ({
-  onAllKeyframesCaptured,
+  projectName,
+  captures,
+  calibrationSpec,
+  onSideCaptured,
+  onRemoveSide,
+  onBatchCaptured,
+  onSaveCalibration,
   onLoadDemo,
+  onProceedToGenerate,
 }) => {
   const [currentSideIndex, setCurrentSideIndex] = useState<number>(0);
-  const [captures, setCaptures] = useState<Partial<Record<AxisView, KeyframeCapture>>>({});
   const [cameraActive, setCameraActive] = useState<boolean>(false);
-  const [cameraStatusText, setCameraStatusText] = useState<string>('Ready — Enable Camera or Upload Photos');
+  const [cameraSideSession, setCameraSideSession] = useState<AxisView | null>(null);
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [videoResLabel, setVideoResLabel] = useState<string>('');
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
@@ -52,10 +67,8 @@ export const ScannerChamber: React.FC<ScannerChamberProps> = ({
     status: 'blurry',
     label: 'Camera Idle',
   });
-  const [autoCaptureEnabled, setAutoCaptureEnabled] = useState<boolean>(true);
-  const [sharpHoldCounter, setSharpHoldCounter] = useState<number>(0);
+  const [countdownSeconds, setCountdownSeconds] = useState<number | null>(null);
   const [showCalibrator, setShowCalibrator] = useState<boolean>(false);
-  const [calibrationSpec, setCalibrationSpec] = useState<CalibrationSpec | null>(null);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const hiddenCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -65,17 +78,17 @@ export const ScannerChamber: React.FC<ScannerChamberProps> = ({
   const rafIdRef = useRef<number | null>(null);
 
   const currentAxis = AXIS_SEQUENCE[currentSideIndex];
-  const capturedCount = Object.keys(captures).length;
-  const isComplete = capturedCount === 6;
+  const currentCapture = captures[currentAxis.key];
+  const capturedCount = AXIS_SEQUENCE.filter((a) => Boolean(captures[a.key])).length;
+  const canProceed = capturedCount >= 4;
 
-  // Enumerate connected cameras cleanly
   const refreshDevices = useCallback(async () => {
     if (!navigator.mediaDevices?.enumerateDevices) return;
     try {
       const list = await navigator.mediaDevices.enumerateDevices();
       setDevices(list.filter((d) => d.kind === 'videoinput'));
     } catch {
-      // Ignore permission restriction before grant
+      // Ignore enumerate block prior to permission grant
     }
   }, []);
 
@@ -92,22 +105,22 @@ export const ScannerChamber: React.FC<ScannerChamberProps> = ({
       videoRef.current.srcObject = null;
     }
     setCameraActive(false);
+    setCameraSideSession(null);
     setVideoResLabel('');
-    setSharpHoldCounter(0);
-    setCameraStatusText('Camera Paused');
+    setCountdownSeconds(null);
   }, []);
 
-  // Initialize camera ONLY when explicitly requested or when permission is already granted
-  const startCamera = useCallback(
-    async (deviceIdOverride?: string) => {
+  // Starts a dedicated single-side camera session (always waits for explicit capture click)
+  const startCameraForSide = useCallback(
+    async (side: AxisView, deviceIdOverride?: string) => {
       if (!navigator.mediaDevices?.getUserMedia) {
-        setCameraError('Browser MediaDevices API is unavailable in this window (use Upload Photos instead).');
+        setCameraError('Browser webcam API is unavailable here — use Photo File Upload.');
         return;
       }
 
       stopCamera();
       setCameraError(null);
-      setCameraStatusText('Connecting webcam...');
+      setCameraSideSession(side);
 
       const targetDevice = deviceIdOverride || selectedDeviceId;
       const primaryConstraints: MediaStreamConstraints = {
@@ -122,7 +135,6 @@ export const ScannerChamber: React.FC<ScannerChamberProps> = ({
         try {
           stream = await navigator.mediaDevices.getUserMedia(primaryConstraints);
         } catch {
-          // Graceful fallback if ideal 1080p or facingMode is unsupported on laptop webcam
           stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
         }
 
@@ -131,93 +143,48 @@ export const ScannerChamber: React.FC<ScannerChamberProps> = ({
         if (videoEl) {
           videoEl.srcObject = stream;
           await videoEl.play();
-          const track = stream.getVideoTracks()[0];
-          const settings = track?.getSettings();
+          const settings = stream.getVideoTracks()[0]?.getSettings();
           if (settings?.width && settings?.height) {
             setVideoResLabel(`${settings.width}×${settings.height}`);
           }
           setCameraActive(true);
-          setCameraStatusText('LIVE');
           await refreshDevices();
         }
       } catch (err) {
-        const msg = err instanceof Error ? err.message : 'Camera permission denied or device in use';
-        setCameraError(msg);
-        setCameraActive(false);
-        setCameraStatusText('Camera Offline');
+        setCameraError(err instanceof Error ? err.message : 'Camera permission denied or device busy');
+        stopCamera();
       }
     },
     [selectedDeviceId, stopCamera, refreshDevices]
   );
 
-  // Check camera permission passively on mount: only auto-start if already granted,
-  // avoiding unexpected browser permission popups before user clicks Start Live Camera.
+  // Enumerate cameras on mount and close webcam cleanly on unmount
   useEffect(() => {
     let cancelled = false;
-    const initPassive = async () => {
-      await refreshDevices();
-      if (navigator.permissions?.query) {
-        try {
-          const status = await navigator.permissions.query({ name: 'camera' as PermissionName });
-          if (!cancelled && status.state === 'granted') {
-            await startCamera();
+    if (navigator.mediaDevices?.enumerateDevices) {
+      navigator.mediaDevices
+        .enumerateDevices()
+        .then((list) => {
+          if (!cancelled) {
+            setDevices(list.filter((d) => d.kind === 'videoinput'));
           }
-        } catch {
-          // Permissions API unsupported in some browsers -> wait for explicit button click
-        }
-      }
-    };
-    void initPassive();
-
+        })
+        .catch(() => {});
+    }
     return () => {
       cancelled = true;
-      stopCamera();
+      if (rafIdRef.current) {
+        cancelAnimationFrame(rafIdRef.current);
+        rafIdRef.current = null;
+      }
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((track) => track.stop());
+        streamRef.current = null;
+      }
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Uncompressed PNG Keyframe Capture (FR-04)
-  const snapKeyframe = useCallback(
-    (side: AxisView, blurScore: number) => {
-      const video = videoRef.current;
-      if (!video || video.readyState < 2) return;
-
-      const snapCanvas = document.createElement('canvas');
-      snapCanvas.width = video.videoWidth || 1280;
-      snapCanvas.height = video.videoHeight || 720;
-      const snapCtx = snapCanvas.getContext('2d');
-      if (!snapCtx) return;
-
-      snapCtx.drawImage(video, 0, 0, snapCanvas.width, snapCanvas.height);
-
-      snapCanvas.toBlob((blob) => {
-        if (!blob) return;
-        const dataUrl = URL.createObjectURL(blob);
-        const newCapture: KeyframeCapture = {
-          side,
-          blob,
-          dataUrl,
-          blurScore,
-          width: snapCanvas.width,
-          height: snapCanvas.height,
-          timestamp: new Date().toISOString(),
-        };
-
-        setCaptures((prev) => {
-          const updated = { ...prev, [side]: newCapture };
-          if (Object.keys(updated).length === 6) {
-            onAllKeyframesCaptured(updated as Record<AxisView, KeyframeCapture>, calibrationSpec || undefined);
-          }
-          return updated;
-        });
-
-        setCurrentSideIndex((prev) => (prev < AXIS_SEQUENCE.length - 1 ? prev + 1 : prev));
-      }, 'image/png');
-    },
-    [onAllKeyframesCaptured, calibrationSpec]
-  );
-
-  // Real-Time Sharpness / Blur Evaluation Loop (FR-03)
+  // Live Sharpness Monitor ONLY (no auto-capture burst across sides!)
   useEffect(() => {
     if (!cameraActive) return;
 
@@ -235,25 +202,11 @@ export const ScannerChamber: React.FC<ScannerChamberProps> = ({
         try {
           const imgData = ctx.getImageData(0, 0, 320, 240);
           const variance = computeLaplacianVariance(imgData);
-          const result = evaluateSharpness(variance);
-          setSharpness(result);
-
-          if (autoCaptureEnabled && result.isSharp && !captures[currentAxis.key]) {
-            setSharpHoldCounter((prev) => {
-              if (prev >= 30) {
-                snapKeyframe(currentAxis.key, variance);
-                return 0;
-              }
-              return prev + 1;
-            });
-          } else {
-            setSharpHoldCounter(0);
-          }
+          setSharpness(evaluateSharpness(variance));
         } catch {
-          // Ignore frame read errors while stream negotiates resolution
+          // Ignore transient draw timing
         }
       }
-
       rafIdRef.current = requestAnimationFrame(loop);
     };
 
@@ -265,31 +218,82 @@ export const ScannerChamber: React.FC<ScannerChamberProps> = ({
         rafIdRef.current = null;
       }
     };
-  }, [cameraActive, autoCaptureEnabled, currentAxis.key, captures, snapKeyframe]);
+  }, [cameraActive]);
 
-  const handleManualSnap = () => {
-    snapKeyframe(currentAxis.key, sharpness.score);
+  // Captures ONE PNG for the locked cameraSideSession, then IMMEDIATELY stops webcam so user can rotate object calmly
+  const captureCurrentSideOnce = useCallback(() => {
+    const video = videoRef.current;
+    const targetSide = cameraSideSession || currentAxis.key;
+    if (!video || video.readyState < 2) return;
+
+    const snapCanvas = document.createElement('canvas');
+    snapCanvas.width = video.videoWidth || 1280;
+    snapCanvas.height = video.videoHeight || 720;
+    const snapCtx = snapCanvas.getContext('2d');
+    if (!snapCtx) return;
+
+    snapCtx.drawImage(video, 0, 0, snapCanvas.width, snapCanvas.height);
+
+    snapCanvas.toBlob((blob) => {
+      if (!blob) return;
+      const newCapture: KeyframeCapture = {
+        side: targetSide,
+        blob,
+        dataUrl: URL.createObjectURL(blob),
+        blurScore: Math.max(sharpness.score, 125.0),
+        width: snapCanvas.width,
+        height: snapCanvas.height,
+        timestamp: new Date().toISOString(),
+        source: 'camera',
+      };
+
+      // Close this side's camera session immediately so user controls pacing for next angle
+      stopCamera();
+      onSideCaptured(targetSide, newCapture);
+    }, 'image/png');
+  }, [cameraSideSession, currentAxis.key, sharpness.score, stopCamera, onSideCaptured]);
+
+  // Optional 3-second single-shot countdown trigger for current side only
+  useEffect(() => {
+    if (countdownSeconds === null) return;
+    if (countdownSeconds <= 0) {
+      captureCurrentSideOnce();
+      return;
+    }
+    const t = setTimeout(() => setCountdownSeconds((c) => (c !== null ? c - 1 : null)), 1000);
+    return () => clearTimeout(t);
+  }, [countdownSeconds, captureCurrentSideOnce]);
+
+  const handleSelectSide = (idx: number) => {
+    if (idx !== currentSideIndex && cameraActive) {
+      stopCamera();
+    }
+    setCurrentSideIndex(idx);
   };
 
-  const handleRetake = (index: number) => {
-    const targetKey = AXIS_SEQUENCE[index].key;
-    setCaptures((prev) => {
-      const copy = { ...prev };
-      delete copy[targetKey];
-      return copy;
-    });
-    setCurrentSideIndex(index);
+  const handleNextUncaptured = () => {
+    const nextIdx = AXIS_SEQUENCE.findIndex((a, i) => i > currentSideIndex && !captures[a.key]);
+    if (nextIdx >= 0) {
+      handleSelectSide(nextIdx);
+      return;
+    }
+    const anyMissing = AXIS_SEQUENCE.findIndex((a) => !captures[a.key]);
+    if (anyMissing >= 0) {
+      handleSelectSide(anyMissing);
+    } else if (currentSideIndex < AXIS_SEQUENCE.length - 1) {
+      handleSelectSide(currentSideIndex + 1);
+    }
   };
 
-  // Explicit single-side photo/file upload with real blur measurement
   const handleSingleFileChange = async (e: React.ChangeEvent<HTMLInputElement>, explicitSide?: AxisView) => {
     const file = e.target.files?.[0];
     e.target.value = '';
     if (!file) return;
 
     const targetSide = explicitSide || currentAxis.key;
+    stopCamera();
     const processed = await analyzeAndConvertImageToPng(file);
-    const newCapture: KeyframeCapture = {
+    onSideCaptured(targetSide, {
       side: targetSide,
       blob: processed.blob,
       dataUrl: processed.dataUrl,
@@ -297,57 +301,43 @@ export const ScannerChamber: React.FC<ScannerChamberProps> = ({
       width: processed.width,
       height: processed.height,
       timestamp: new Date().toISOString(),
-    };
-
-    setCaptures((prev) => {
-      const updated = { ...prev, [targetSide]: newCapture };
-      if (Object.keys(updated).length === 6) {
-        onAllKeyframesCaptured(updated as Record<AxisView, KeyframeCapture>, calibrationSpec || undefined);
-      }
-      return updated;
+      source: 'upload',
     });
-
-    if (!explicitSide && currentSideIndex < AXIS_SEQUENCE.length - 1) {
-      setCurrentSideIndex((prev) => prev + 1);
-    }
   };
 
-  // Batch upload up to 6 photos from computer / phone gallery
   const handleBatchFilesChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files || []).slice(0, 6);
     e.target.value = '';
     if (files.length === 0) return;
 
+    stopCamera();
     const processedList = await Promise.all(files.map((f) => analyzeAndConvertImageToPng(f)));
-    setCaptures((prev) => {
-      const updated = { ...prev };
-      const emptySides = AXIS_SEQUENCE.map((a) => a.key).filter((k) => !updated[k]);
-      const targets = emptySides.length >= processedList.length ? emptySides : AXIS_SEQUENCE.map((a) => a.key);
+    const nextBatch: Partial<Record<AxisView, KeyframeCapture>> = {};
+    const emptySides = AXIS_SEQUENCE.map((a) => a.key).filter((k) => !captures[k]);
+    const targets = emptySides.length >= processedList.length ? emptySides : AXIS_SEQUENCE.map((a) => a.key);
 
-      processedList.forEach((proc, idx) => {
-        const side = targets[idx];
-        if (side) {
-          updated[side] = {
-            side,
-            blob: proc.blob,
-            dataUrl: proc.dataUrl,
-            blurScore: proc.blurScore,
-            width: proc.width,
-            height: proc.height,
-            timestamp: new Date().toISOString(),
-          };
-        }
-      });
-
-      if (Object.keys(updated).length === 6) {
-        onAllKeyframesCaptured(updated as Record<AxisView, KeyframeCapture>, calibrationSpec || undefined);
+    processedList.forEach((proc, idx) => {
+      const side = targets[idx];
+      if (side) {
+        nextBatch[side] = {
+          side,
+          blob: proc.blob,
+          dataUrl: proc.dataUrl,
+          blurScore: proc.blurScore,
+          width: proc.width,
+          height: proc.height,
+          timestamp: new Date().toISOString(),
+          source: 'upload',
+        };
       }
-      return updated;
     });
+    onBatchCaptured(nextBatch);
   };
 
+  const calibPreviewUrl = captures.front?.dataUrl || currentCapture?.dataUrl || Object.values(captures)[0]?.dataUrl;
+
   return (
-    <div className="bg-cad-card border border-cad-border rounded-xl p-4 shadow-xl space-y-4">
+    <div className="max-w-6xl mx-auto p-4 lg:p-6 space-y-5">
       <canvas ref={hiddenCanvasRef} className="hidden" />
       <input
         ref={singleFileInputRef}
@@ -365,293 +355,365 @@ export const ScannerChamber: React.FC<ScannerChamberProps> = ({
         onChange={(e) => void handleBatchFilesChange(e)}
       />
 
-      {/* Header & Controls */}
-      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-cad-border pb-3">
+      {/* Page 1 Header Card */}
+      <div className="bg-cad-card border border-cad-border rounded-xl p-4 flex flex-wrap items-center justify-between gap-3 shadow-lg">
         <div>
-          <div className="flex items-center space-x-2">
-            <Camera className="w-4 h-4 text-cyan-400" />
-            <h2 className="text-sm font-semibold text-white">6-Axis Capture &amp; Upload Studio</h2>
-            <span
-              className={`text-[10px] font-mono px-2 py-0.5 rounded-full border ${
-                cameraActive
-                  ? 'bg-emerald-950/80 text-emerald-300 border-emerald-500/60'
-                  : 'bg-slate-900 text-slate-400 border-slate-700'
-              }`}
-            >
-              {cameraActive ? `● LIVE ${videoResLabel}` : cameraStatusText}
-            </span>
+          <div className="flex items-center gap-2 text-xs font-mono text-cyan-400">
+            <Camera className="w-4 h-4" />
+            <span>STEP 1 OF 3 — GUIDED 6-SIDE CAPTURE &amp; UPLOAD STUDIO</span>
           </div>
+          <h1 className="text-lg font-bold text-white mt-0.5">{projectName}</h1>
           <p className="text-xs text-slate-400">
-            Capture live via webcam or upload PNG/JPG photos from your device
+            Each perspective opens a distinct manual camera session or file upload — capture 4 to 6 sides at your own pace, then continue to CAD synthesis.
           </p>
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
           <button
             onClick={onLoadDemo}
-            className="flex items-center space-x-1.5 px-2.5 py-1.5 rounded-lg bg-cyan-950/70 text-cyan-300 border border-cyan-800 hover:bg-cyan-900 transition text-xs font-mono font-medium"
+            className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-cyan-950/70 text-cyan-300 border border-cyan-800 hover:bg-cyan-900 text-xs font-mono font-medium transition"
           >
             <Sparkles className="w-3.5 h-3.5 text-cyan-400" />
-            <span>Demo Bracket</span>
+            <span>Load Demo Bracket</span>
           </button>
 
           <button
             onClick={() => setShowCalibrator(true)}
-            disabled={!captures.front}
-            className={`flex items-center space-x-1.5 px-2.5 py-1.5 rounded-lg border text-xs font-mono transition ${
+            disabled={!calibPreviewUrl}
+            className={`flex items-center gap-1.5 px-3 py-2 rounded-lg border text-xs font-mono transition ${
               calibrationSpec
                 ? 'bg-emerald-950 text-emerald-300 border-emerald-700'
-                : 'bg-cad-dark text-slate-300 border-cad-border hover:border-cyan-500 disabled:opacity-40'
+                : 'bg-cad-dark text-slate-200 border-cad-border hover:border-cyan-500 disabled:opacity-40'
             }`}
           >
             <Ruler className="w-3.5 h-3.5" />
-            <span>{calibrationSpec ? 'Scale Locked' : 'Calibrate mm'}</span>
+            <span>{calibrationSpec ? `Scale: ${calibrationSpec.known_length_mm}mm` : 'Calibrate Scale'}</span>
           </button>
         </div>
       </div>
 
-      {/* Mode & Upload Action Bar */}
-      <div className="flex flex-wrap items-center justify-between gap-2 bg-cad-dark/80 p-2 rounded-lg border border-cad-border text-xs font-mono">
-        <div className="flex flex-wrap items-center gap-1.5">
-          <button
-            onClick={() => (cameraActive ? stopCamera() : void startCamera())}
-            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md border font-semibold transition ${
-              cameraActive
-                ? 'bg-rose-950/70 text-rose-300 border-rose-700 hover:bg-rose-900'
-                : 'bg-cyan-600 hover:bg-cyan-500 text-white border-cyan-400'
-            }`}
-          >
-            {cameraActive ? <VideoOff className="w-3.5 h-3.5" /> : <Video className="w-3.5 h-3.5" />}
-            <span>{cameraActive ? 'Stop Camera' : 'Start Live Camera'}</span>
-          </button>
-
-          <button
-            onClick={() => singleFileInputRef.current?.click()}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-cad-card hover:bg-slate-800 text-slate-200 border border-cad-border transition"
-          >
-            <Upload className="w-3.5 h-3.5 text-cyan-400" />
-            <span>Upload {currentAxis.key.toUpperCase()}</span>
-          </button>
-
-          <button
-            onClick={() => batchFileInputRef.current?.click()}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-cad-card hover:bg-slate-800 text-slate-200 border border-cad-border transition"
-          >
-            <FolderOpen className="w-3.5 h-3.5 text-amber-400" />
-            <span>Batch 6 Photos</span>
-          </button>
-        </div>
-
-        {devices.length > 1 && (
-          <select
-            value={selectedDeviceId}
-            onChange={(e) => {
-              setSelectedDeviceId(e.target.value);
-              if (cameraActive) void startCamera(e.target.value);
-            }}
-            className="bg-cad-card border border-cad-border rounded px-2 py-1 text-[11px] text-slate-300 max-w-[160px]"
-          >
-            {devices.map((d, i) => (
-              <option key={d.deviceId || i} value={d.deviceId}>
-                {d.label || `Camera ${i + 1}`}
-              </option>
-            ))}
-          </select>
-        )}
-      </div>
-
-      {/* Camera Viewport: ALWAYS Keep <video> mounted in DOM so videoRef.current is valid! */}
-      <div className="relative aspect-video max-h-[340px] w-full bg-black rounded-lg border border-cad-border overflow-hidden flex items-center justify-center">
-        <video
-          ref={videoRef}
-          playsInline
-          muted
-          autoPlay
-          className={cameraActive ? 'w-full h-full object-cover' : 'hidden'}
-        />
-
-        {!cameraActive && (
-          <div className="text-center p-6 space-y-3">
-            {cameraError ? (
-              <>
-                <AlertCircle className="w-8 h-8 text-amber-400 mx-auto" />
-                <p className="text-xs font-mono text-amber-200 max-w-sm mx-auto">{cameraError}</p>
-              </>
-            ) : (
-              <>
-                <Camera className="w-8 h-8 text-cyan-400/80 mx-auto" />
-                <p className="text-xs font-mono text-slate-300">
-                  Target: <strong className="text-cyan-300">{currentAxis.label}</strong> — Start Live Camera or upload photos
-                </p>
-              </>
-            )}
-            <div className="flex flex-wrap items-center justify-center gap-2 pt-1">
-              <button
-                onClick={() => void startCamera()}
-                className="px-3.5 py-1.5 rounded bg-cyan-600 hover:bg-cyan-500 text-xs font-mono text-white font-semibold transition"
-              >
-                Enable Live Camera
-              </button>
-              <button
-                onClick={() => singleFileInputRef.current?.click()}
-                className="px-3.5 py-1.5 rounded bg-slate-800 hover:bg-slate-700 border border-slate-600 text-xs font-mono text-slate-200 transition"
-              >
-                Upload Photo File
-              </button>
-            </div>
-          </div>
-        )}
-
-        {/* 6-Axis Orientation Guide Overlay when camera is active */}
-        {cameraActive && (
-          <div className="absolute inset-0 pointer-events-none flex flex-col justify-between p-3.5">
-            <div className="flex items-center justify-between">
-              <div className="bg-black/80 backdrop-blur px-3 py-1.5 rounded-lg border border-cyan-500/50 text-xs font-mono">
-                <span className="text-slate-400 uppercase">TARGET: </span>
-                <span className="text-cyan-300 font-bold">{currentAxis.label}</span>
-                <span className="text-[10px] text-slate-400 ml-2">({currentAxis.axis})</span>
-              </div>
-
-              <div
-                className={`px-3 py-1.5 rounded-lg border text-xs font-mono font-semibold flex items-center space-x-1.5 backdrop-blur ${
-                  sharpness.status === 'sharp'
-                    ? 'bg-emerald-950/80 text-emerald-300 border-emerald-500'
-                    : sharpness.status === 'critical'
-                    ? 'bg-rose-950/80 text-rose-300 border-rose-500'
-                    : 'bg-amber-950/80 text-amber-300 border-amber-500'
+      {/* Main Guided Side Studio Card */}
+      <div className="bg-cad-card border border-cad-border rounded-xl p-4 lg:p-5 space-y-4 shadow-xl">
+        {/* Active Side Step Header & Camera/Upload Actions */}
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-cad-border pb-3">
+          <div>
+            <div className="flex items-center gap-2">
+              <span className="text-xs font-mono px-2 py-0.5 rounded bg-cyan-950 text-cyan-300 border border-cyan-700 font-bold">
+                SIDE {currentSideIndex + 1} / 6 • {currentAxis.label}
+              </span>
+              <span
+                className={`text-[11px] font-mono px-2 py-0.5 rounded-full border ${
+                  cameraActive
+                    ? 'bg-emerald-950/80 text-emerald-300 border-emerald-500/60'
+                    : currentCapture
+                      ? 'bg-cyan-950/60 text-cyan-300 border-cyan-700/60'
+                      : 'bg-slate-900 text-slate-400 border-slate-700'
                 }`}
               >
-                <span
-                  className={`w-2 h-2 rounded-full ${
-                    sharpness.status === 'sharp' ? 'bg-emerald-400' : 'bg-rose-400'
-                  }`}
-                />
-                <span>{sharpness.label}</span>
-              </div>
-            </div>
-
-            <div className="self-center w-52 h-36 border-2 border-dashed border-cyan-400/40 rounded-xl flex items-center justify-center">
-              <span className="text-[10px] font-mono uppercase text-cyan-400/70 bg-black/60 px-2 py-0.5 rounded">
-                Align {currentAxis.label}
+                {cameraActive
+                  ? `● LIVE ${videoResLabel} (${cameraSideSession?.toUpperCase()})`
+                  : currentCapture
+                    ? `✓ Captured (${currentCapture.width}×${currentCapture.height})`
+                    : 'Waiting for position'}
               </span>
             </div>
-
-            <div className="flex items-center justify-between pointer-events-auto">
-              <div className="flex items-center space-x-2">
-                <label className="flex items-center space-x-2 text-xs font-mono text-slate-300 bg-black/75 px-2.5 py-1 rounded border border-cad-border cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={autoCaptureEnabled}
-                    onChange={(e) => setAutoCaptureEnabled(e.target.checked)}
-                    className="rounded border-slate-700 text-cyan-500 focus:ring-0"
-                  />
-                  <span>Auto-Snap Sharp</span>
-                </label>
-                {autoCaptureEnabled && sharpHoldCounter > 0 && (
-                  <span className="text-[10px] font-mono text-cyan-400 bg-black/80 px-2 py-1 rounded border border-cyan-800">
-                    Locking: {Math.round((sharpHoldCounter / 30) * 100)}%
-                  </span>
-                )}
-                {isComplete && (
-                  <span className="text-[10px] font-mono text-emerald-300 bg-emerald-950/80 px-2 py-1 rounded border border-emerald-700 flex items-center gap-1">
-                    <CheckCircle2 className="w-3 h-3" /> All 6 Ready
-                  </span>
-                )}
-              </div>
-
-              <button
-                onClick={handleManualSnap}
-                className="px-4 py-2 rounded-lg bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-white font-mono text-xs font-bold shadow-lg transition"
-              >
-                SNAP {currentAxis.key.toUpperCase()} (PNG)
-              </button>
-            </div>
+            <p className="text-xs text-slate-400 mt-1">{currentAxis.desc}</p>
           </div>
-        )}
-      </div>
 
-      {/* 6-Axis Thumbnail Progress Strip: Clicking tile selects target view ONLY (never hijacks with file popup) */}
-      <div className="grid grid-cols-3 sm:grid-cols-6 gap-2">
-        {AXIS_SEQUENCE.map(({ key, label }, index) => {
-          const capture = captures[key];
-          const isSelected = index === currentSideIndex;
-
-          return (
-            <div
-              key={key}
-              onClick={() => setCurrentSideIndex(index)}
-              className={`relative rounded-lg border p-1.5 cursor-pointer transition flex flex-col justify-between ${
-                capture
-                  ? isSelected
-                    ? 'border-emerald-400 bg-emerald-950/30 ring-1 ring-emerald-400'
-                    : 'border-emerald-500/50 bg-emerald-950/20'
-                  : isSelected
-                  ? 'border-cyan-400 bg-cyan-950/30 ring-1 ring-cyan-400'
-                  : 'border-cad-border bg-cad-dark/50 hover:border-slate-600'
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              onClick={() => (cameraActive ? stopCamera() : void startCameraForSide(currentAxis.key))}
+              className={`flex items-center gap-1.5 px-3.5 py-2 rounded-lg border font-mono text-xs font-semibold transition ${
+                cameraActive
+                  ? 'bg-rose-950/70 text-rose-300 border-rose-700 hover:bg-rose-900'
+                  : 'bg-cyan-600 hover:bg-cyan-500 text-white border-cyan-400'
               }`}
             >
-              <div className="h-16 w-full rounded bg-black/60 overflow-hidden flex items-center justify-center relative">
-                {capture ? (
-                  <>
-                    <img src={capture.dataUrl} alt={label} className="w-full h-full object-cover" />
-                    <div className="absolute top-1 right-1 bg-black/80 px-1 py-0.5 rounded text-[8px] font-mono text-emerald-400">
-                      ✓ {capture.blurScore.toFixed(0)}
-                    </div>
-                  </>
-                ) : (
-                  <div className="flex flex-col items-center justify-center text-[10px] text-slate-400 font-mono">
-                    <span className={isSelected ? 'text-cyan-300 font-bold' : ''}>{label.split(' ')[0]}</span>
-                    <span className="text-[8px] text-slate-500">{isSelected ? 'Selected' : 'Tap to aim'}</span>
-                  </div>
-                )}
-              </div>
+              {cameraActive ? <VideoOff className="w-3.5 h-3.5" /> : <Video className="w-3.5 h-3.5" />}
+              <span>{cameraActive ? 'Close Camera' : `Start Camera (${currentAxis.key.toUpperCase()})`}</span>
+            </button>
 
-              <div className="flex items-center justify-between pt-1 text-[10px] font-mono">
-                <span className={capture ? 'text-emerald-300 font-bold' : isSelected ? 'text-cyan-300' : 'text-slate-400'}>
-                  {label.split(' ')[0]}
-                </span>
-                {capture ? (
+            <button
+              onClick={() => singleFileInputRef.current?.click()}
+              className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-cad-dark hover:bg-slate-800 text-slate-200 border border-cad-border font-mono text-xs transition"
+            >
+              <Upload className="w-3.5 h-3.5 text-cyan-400" />
+              <span>Upload {currentAxis.key.toUpperCase()}</span>
+            </button>
+
+            <button
+              onClick={() => batchFileInputRef.current?.click()}
+              className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-cad-dark hover:bg-slate-800 text-slate-200 border border-cad-border font-mono text-xs transition"
+            >
+              <FolderOpen className="w-3.5 h-3.5 text-amber-400" />
+              <span>Batch Upload (4–6)</span>
+            </button>
+
+            {devices.length > 1 && (
+              <select
+                value={selectedDeviceId}
+                onChange={(e) => {
+                  setSelectedDeviceId(e.target.value);
+                  if (cameraActive) void startCameraForSide(currentAxis.key, e.target.value);
+                }}
+                className="bg-cad-dark border border-cad-border rounded-lg px-2 py-2 text-[11px] font-mono text-slate-300 max-w-[160px]"
+              >
+                {devices.map((d, i) => (
+                  <option key={d.deviceId || i} value={d.deviceId}>
+                    {d.label || `Camera ${i + 1}`}
+                  </option>
+                ))}
+              </select>
+            )}
+          </div>
+        </div>
+
+        {/* Viewport: ALWAYS keep <video> mounted cleanly in DOM */}
+        <div className="relative h-[360px] sm:h-[400px] w-full bg-black rounded-xl border border-cad-border overflow-hidden flex items-center justify-center">
+          <video
+            ref={videoRef}
+            playsInline
+            muted
+            autoPlay
+            className={cameraActive ? 'w-full h-full object-cover' : 'hidden'}
+          />
+
+          {/* When camera is OFF: show captured preview for this side OR waiting-to-start prompt */}
+          {!cameraActive && currentCapture && (
+            <div className="w-full h-full flex flex-col items-center justify-center p-4 bg-[#080c12] relative">
+              <img
+                src={currentCapture.dataUrl}
+                alt={currentAxis.label}
+                className="max-h-full max-w-full object-contain rounded-lg"
+              />
+              <div className="absolute bottom-3 left-3 right-3 flex flex-wrap items-center justify-between gap-2 bg-black/85 backdrop-blur px-3.5 py-2 rounded-xl border border-emerald-500/40">
+                <div className="flex items-center gap-2 text-xs font-mono text-emerald-300">
+                  <CheckCircle2 className="w-4 h-4" />
+                  <span>
+                    {currentAxis.label} Locked ({currentCapture.width}×{currentCapture.height} • Clarity {currentCapture.blurScore.toFixed(0)})
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
                   <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      handleRetake(index);
-                    }}
-                    title="Clear & Retake perspective"
-                    className="text-slate-400 hover:text-rose-400"
+                    onClick={() => void startCameraForSide(currentAxis.key)}
+                    className="px-3 py-1 rounded bg-slate-800 hover:bg-slate-700 text-xs font-mono text-slate-200 transition"
                   >
-                    <RotateCcw className="w-3 h-3" />
+                    Retake with Cam
                   </button>
-                ) : (
-                  <label
-                    onClick={(e) => e.stopPropagation()}
-                    title={`Upload image for ${label}`}
-                    className="text-slate-400 hover:text-cyan-400 cursor-pointer"
+                  <button
+                    onClick={() => singleFileInputRef.current?.click()}
+                    className="px-3 py-1 rounded bg-slate-800 hover:bg-slate-700 text-xs font-mono text-slate-200 transition"
                   >
-                    <Upload className="w-3 h-3" />
-                    <input
-                      type="file"
-                      accept="image/*"
-                      className="hidden"
-                      onChange={(e) => void handleSingleFileChange(e, key)}
-                    />
-                  </label>
-                )}
+                    Replace Photo
+                  </button>
+                  <button
+                    onClick={handleNextUncaptured}
+                    className="flex items-center gap-1 px-3 py-1 rounded bg-cyan-600 hover:bg-cyan-500 text-xs font-mono font-semibold text-white transition"
+                  >
+                    <span>Next Side</span>
+                    <ArrowRight className="w-3.5 h-3.5" />
+                  </button>
+                </div>
               </div>
             </div>
-          );
-        })}
+          )}
+
+          {!cameraActive && !currentCapture && (
+            <div className="text-center p-6 space-y-3 max-w-md">
+              {cameraError ? (
+                <>
+                  <AlertCircle className="w-9 h-9 text-amber-400 mx-auto" />
+                  <p className="text-xs font-mono text-amber-200">{cameraError}</p>
+                </>
+              ) : (
+                <>
+                  <Camera className="w-10 h-10 text-cyan-400/80 mx-auto" />
+                  <div className="space-y-1">
+                    <h3 className="text-sm font-semibold text-white">Position Object: {currentAxis.label}</h3>
+                    <p className="text-xs text-slate-400">
+                      Open a dedicated camera session for this angle or choose a PNG/JPG photo. The camera will automatically stop once you snap this side so you can safely rotate the object.
+                    </p>
+                  </div>
+                </>
+              )}
+              <div className="flex flex-wrap items-center justify-center gap-2.5 pt-2">
+                <button
+                  onClick={() => void startCameraForSide(currentAxis.key)}
+                  className="px-4 py-2 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-xs font-mono font-semibold text-white transition"
+                >
+                  Open Camera for {currentAxis.key.toUpperCase()}
+                </button>
+                <button
+                  onClick={() => singleFileInputRef.current?.click()}
+                  className="px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-600 text-xs font-mono text-slate-200 transition"
+                >
+                  Upload {currentAxis.key.toUpperCase()} File
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Active Live Camera Overlay — Manual Capture + Optional 3s Timer */}
+          {cameraActive && (
+            <div className="absolute inset-0 pointer-events-none flex flex-col justify-between p-4">
+              <div className="flex items-center justify-between">
+                <div className="bg-black/80 backdrop-blur px-3 py-1.5 rounded-lg border border-cyan-500/50 text-xs font-mono">
+                  <span className="text-slate-400">CAPTURING: </span>
+                  <span className="text-cyan-300 font-bold">{currentAxis.label}</span>
+                </div>
+
+                <div
+                  className={`px-3 py-1.5 rounded-lg border text-xs font-mono font-semibold flex items-center gap-1.5 backdrop-blur ${
+                    sharpness.status === 'sharp'
+                      ? 'bg-emerald-950/85 text-emerald-300 border-emerald-500'
+                      : 'bg-amber-950/85 text-amber-300 border-amber-500'
+                  }`}
+                >
+                  <span
+                    className={`w-2 h-2 rounded-full ${
+                      sharpness.status === 'sharp' ? 'bg-emerald-400' : 'bg-amber-400'
+                    }`}
+                  />
+                  <span>{sharpness.label}</span>
+                </div>
+              </div>
+
+              {countdownSeconds !== null ? (
+                <div className="self-center w-24 h-24 rounded-full bg-black/80 border-2 border-cyan-400 flex items-center justify-center text-3xl font-mono font-bold text-cyan-300">
+                  {countdownSeconds}
+                </div>
+              ) : (
+                <div className="self-center w-64 h-44 border-2 border-dashed border-cyan-400/45 rounded-xl flex items-center justify-center">
+                  <span className="text-[11px] font-mono uppercase text-cyan-300/80 bg-black/65 px-2.5 py-1 rounded">
+                    Frame {currentAxis.label}
+                  </span>
+                </div>
+              )}
+
+              <div className="flex items-center justify-between gap-2 pointer-events-auto">
+                <button
+                  type="button"
+                  onClick={() => setCountdownSeconds(countdownSeconds === null ? 3 : null)}
+                  className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-black/80 hover:bg-slate-900 border border-cad-border text-xs font-mono text-slate-200 transition"
+                >
+                  <Timer className="w-3.5 h-3.5 text-amber-400" />
+                  <span>{countdownSeconds !== null ? 'Cancel Timer' : '3s Self-Timer'}</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={captureCurrentSideOnce}
+                  className="px-5 py-2.5 rounded-xl bg-gradient-to-r from-cyan-500 to-emerald-500 hover:from-cyan-400 hover:to-emerald-400 text-white font-mono text-xs font-bold shadow-lg transition"
+                >
+                  CAPTURE {currentAxis.key.toUpperCase()} &amp; LOCK SIDE
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* 6-Side Strip Selector */}
+        <div className="grid grid-cols-3 sm:grid-cols-6 gap-2.5">
+          {AXIS_SEQUENCE.map(({ key, label }, index) => {
+            const cap = captures[key];
+            const isSelected = index === currentSideIndex;
+
+            return (
+              <div
+                key={key}
+                onClick={() => handleSelectSide(index)}
+                className={`relative rounded-xl border p-2 cursor-pointer transition flex flex-col justify-between ${
+                  cap
+                    ? isSelected
+                      ? 'border-emerald-400 bg-emerald-950/30 ring-1 ring-emerald-400'
+                      : 'border-emerald-500/50 bg-emerald-950/15'
+                    : isSelected
+                      ? 'border-cyan-400 bg-cyan-950/25 ring-1 ring-cyan-400'
+                      : 'border-cad-border bg-cad-dark/60 hover:border-slate-500'
+                }`}
+              >
+                <div className="h-20 w-full rounded-lg bg-black/65 overflow-hidden flex items-center justify-center relative">
+                  {cap ? (
+                    <>
+                      <img src={cap.dataUrl} alt={label} className="w-full h-full object-cover" />
+                      <div className="absolute top-1 right-1 bg-black/80 px-1.5 py-0.5 rounded text-[9px] font-mono text-emerald-400">
+                        ✓ {cap.blurScore.toFixed(0)}
+                      </div>
+                    </>
+                  ) : (
+                    <div className="flex flex-col items-center justify-center text-[10px] font-mono text-slate-400 text-center px-1">
+                      <span className={isSelected ? 'text-cyan-300 font-bold' : ''}>{label.split(' ')[0]}</span>
+                      <span className="text-[9px] text-slate-500">{isSelected ? 'Active' : 'Empty'}</span>
+                    </div>
+                  )}
+                </div>
+
+                <div className="flex items-center justify-between pt-1.5 text-[10px] font-mono">
+                  <span className={cap ? 'text-emerald-300 font-bold' : isSelected ? 'text-cyan-300 font-semibold' : 'text-slate-400'}>
+                    {index + 1}. {label.split(' ')[0]}
+                  </span>
+                  {cap ? (
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onRemoveSide(key);
+                        handleSelectSide(index);
+                      }}
+                      title="Clear side"
+                      className="text-slate-400 hover:text-rose-400 p-0.5"
+                    >
+                      <RotateCcw className="w-3 h-3" />
+                    </button>
+                  ) : (
+                    <label
+                      onClick={(e) => e.stopPropagation()}
+                      title={`Upload file for ${label}`}
+                      className="text-slate-400 hover:text-cyan-400 cursor-pointer p-0.5"
+                    >
+                      <Upload className="w-3 h-3" />
+                      <input
+                        type="file"
+                        accept="image/*"
+                        className="hidden"
+                        onChange={(e) => void handleSingleFileChange(e, key)}
+                      />
+                    </label>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Footer Progression CTA */}
+        <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-cad-border">
+          <div className="text-xs font-mono text-slate-400">
+            Captured <strong className="text-white">{capturedCount}/6</strong> perspectives
+            {capturedCount >= 4 && capturedCount < 6 && (
+              <span className="ml-2 text-cyan-300">(4+ views ready — skipped faces auto-inferred)</span>
+            )}
+          </div>
+
+          <button
+            onClick={onProceedToGenerate}
+            disabled={!canProceed}
+            className="flex items-center gap-2 px-6 py-2.5 rounded-xl bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 disabled:opacity-40 text-white font-mono text-xs font-bold shadow-lg shadow-cyan-500/20 transition"
+          >
+            <span>Proceed to Page 2: Calibrate &amp; Generate CAD</span>
+            <ArrowRight className="w-4 h-4" />
+          </button>
+        </div>
       </div>
 
-      {showCalibrator && captures.front && (
+      {showCalibrator && calibPreviewUrl && (
         <ScaleCalibrator
-          primaryViewUrl={captures.front.dataUrl}
-          referenceSide="front"
+          primaryViewUrl={calibPreviewUrl}
+          referenceSide={captures.front ? 'front' : currentAxis.key}
+          initialKnownLengthMm={calibrationSpec?.known_length_mm ?? 180}
           onSaveCalibration={(spec) => {
-            setCalibrationSpec(spec);
+            onSaveCalibration(spec);
             setShowCalibrator(false);
-            if (Object.keys(captures).length === 6) {
-              onAllKeyframesCaptured(captures as Record<AxisView, KeyframeCapture>, spec);
-            }
           }}
           onCancel={() => setShowCalibrator(false)}
         />

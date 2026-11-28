@@ -2,6 +2,48 @@ import React, { useState, useRef } from 'react';
 import type { MouseEvent } from 'react';
 import { Ruler, Check, X, Crosshair, CreditCard, Compass } from 'lucide-react';
 import type { CalibrationSpec, AxisView } from '../../types/cad';
+import { detectScaleReference } from '../../utils/scaleDetection';
+import type {
+  DetectedReference,
+  DetectionMode,
+  PixelImage,
+  PointPx,
+} from '../../utils/scaleDetection';
+
+type CalibrationMode = DetectionMode | 'known_dimension';
+
+interface LoadedPixels {
+  pixels: PixelImage;
+  scale: number;
+}
+
+/** Loads a same-origin/data/blob image into a bounded canvas for detection. */
+async function loadPixelImage(url: string): Promise<LoadedPixels> {
+  const image = new Image();
+  image.crossOrigin = 'anonymous';
+  await new Promise<void>((resolve, reject) => {
+    image.onload = () => resolve();
+    image.onerror = () => reject(new Error('reference image could not be decoded'));
+    image.src = url;
+  });
+
+  const maxSide = Math.max(image.naturalWidth, image.naturalHeight);
+  const scale = Math.min(1, 1600 / Math.max(1, maxSide));
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+  canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+  const context = canvas.getContext('2d', { willReadFrequently: true });
+  if (!context) throw new Error('2D canvas context unavailable');
+  context.drawImage(image, 0, 0, canvas.width, canvas.height);
+  return {
+    pixels: {
+      width: canvas.width,
+      height: canvas.height,
+      data: context.getImageData(0, 0, canvas.width, canvas.height).data,
+    },
+    scale,
+  };
+}
 
 interface ScaleCalibratorProps {
   primaryViewUrl: string;
@@ -18,27 +60,75 @@ export const ScaleCalibrator: React.FC<ScaleCalibratorProps> = ({
   onCancel,
   initialKnownLengthMm = 64.5
 }) => {
-  const [mode, setMode] = useState<'known_dimension' | 'id1_card' | 'aruco_token'>('known_dimension');
+  const [mode, setMode] = useState<CalibrationMode>('known_dimension');
   const [knownLengthMm, setKnownLengthMm] = useState<number>(initialKnownLengthMm);
   const [pointA, setPointA] = useState<[number, number] | null>(null);
   const [pointB, setPointB] = useState<[number, number] | null>(null);
   const [activePoint, setActivePoint] = useState<'A' | 'B'>('A');
   const [imgDims, setImgDims] = useState<[number, number] | null>(null);
+  const [detection, setDetection] = useState<DetectedReference | null>(null);
+  const [detectionStatus, setDetectionStatus] = useState<string>('');
 
   const imgRef = useRef<HTMLImageElement>(null);
 
-  const handleModeSelect = (nextMode: 'known_dimension' | 'id1_card' | 'aruco_token') => {
+  const runAutoDetect = async (nextMode: DetectionMode) => {
+    setDetection(null);
+    if (!primaryViewUrl) {
+      setDetectionStatus('No reference image loaded — place points A and B manually.');
+      return;
+    }
+    try {
+      const loaded = await loadPixelImage(primaryViewUrl);
+      const found = detectScaleReference(loaded.pixels, nextMode);
+      if (!found) {
+        setDetectionStatus('No ID-1 card or fiducial found — place points A and B manually.');
+        return;
+      }
+      const toNatural = (point: PointPx): [number, number] => [
+        Math.round(point[0] / loaded.scale),
+        Math.round(point[1] / loaded.scale),
+      ];
+      const naturalCorners = found.cornersPx.map(toNatural) as DetectedReference['cornersPx'];
+      const naturalPixels = found.referencePixels / loaded.scale;
+      const natural: DetectedReference = {
+        ...found,
+        cornersPx: naturalCorners,
+        referencePixels: naturalPixels,
+        mmPerUnit: found.referenceLengthMm / naturalPixels,
+      };
+      setDetection(natural);
+      setKnownLengthMm(natural.referenceLengthMm);
+      setPointA(naturalCorners[0]);
+      setPointB(naturalCorners[1]);
+      setActivePoint('A');
+      setDetectionStatus(
+        `Auto-detected ${nextMode === 'id1_card' ? 'ID-1 card' : `ArUco marker #${natural.markerId ?? '?'}`}` +
+        ` — ${natural.referenceLengthMm} mm over ${natural.referencePixels.toFixed(1)} px`,
+      );
+    } catch {
+      setDetectionStatus('Auto-detection unavailable for this image — place points A and B manually.');
+    }
+  };
+
+  const handleModeSelect = (nextMode: CalibrationMode) => {
     setMode(nextMode);
     if (nextMode === 'id1_card') {
       setKnownLengthMm(85.6);
     } else if (nextMode === 'aruco_token') {
       setKnownLengthMm(20.0);
     }
+    if (nextMode === 'known_dimension') {
+      setDetection(null);
+      setDetectionStatus('');
+    } else {
+      void runAutoDetect(nextMode);
+    }
   };
 
   const handleImageLoad = () => {
     if (imgRef.current && imgRef.current.naturalWidth > 0) {
       setImgDims([imgRef.current.naturalWidth, imgRef.current.naturalHeight]);
+      if (mode !== 'known_dimension') void runAutoDetect(mode);
     }
   };
 
@@ -155,51 +245,82 @@ export const ScaleCalibrator: React.FC<ScaleCalibratorProps> = ({
                   : 'Click opposing edges of the 20mm ArUco marker.'}
               </p>
               <p className="text-[11px] text-slate-400">
-                Active Selection: <span className="text-cyan-400 font-bold">Point {activePoint}</span>. Click on the image below to place.
+                {mode === 'known_dimension'
+                  ? 'Active Selection:'
+                  : 'Auto-detected reference (override by clicking):'}{' '}
+                <span className="text-cyan-400 font-bold">Point {activePoint}</span>. Click on the image below to place.
               </p>
+              {mode !== 'known_dimension' && (
+                <p className={`text-[11px] mt-1 ${detection ? 'text-emerald-400' : 'text-amber-400'}`}>
+                  {detectionStatus || 'Detecting reference...'}
+                </p>
+              )}
             </div>
-            <div className="text-right">
-              <span className="text-[10px] text-slate-400 uppercase">Ref View:</span>
-              <span className="text-xs font-bold text-white ml-1 uppercase">{referenceSide}</span>
+            <div className="text-right shrink-0 pl-3">
+              <div>
+                <span className="text-[10px] text-slate-400 uppercase">Ref View:</span>
+                <span className="text-xs font-bold text-white ml-1 uppercase">{referenceSide}</span>
+              </div>
+              {mode !== 'known_dimension' && (
+                <button
+                  onClick={() => void runAutoDetect(mode)}
+                  className="mt-1.5 px-2 py-1 rounded border border-cyan-700 text-[10px] text-cyan-300 hover:bg-cyan-900/40 flex items-center gap-1"
+                >
+                  <Crosshair className="w-3 h-3" /> Re-detect
+                </button>
+              )}
             </div>
           </div>
 
           {/* Interactive Image Canvas */}
-          <div
-            onClick={handleImageClick}
-            className="relative bg-black rounded-lg border border-cad-border overflow-hidden cursor-crosshair flex items-center justify-center min-h-[300px]"
-          >
-            <img
-              ref={imgRef}
-              onLoad={handleImageLoad}
-              src={primaryViewUrl}
-              alt="Calibration Reference"
-              className="max-h-[380px] w-auto object-contain select-none pointer-events-auto"
-            />
+          <div className="bg-black rounded-lg border border-cad-border flex items-center justify-center min-h-[300px] p-2">
+            {/* Overlay host is sized exactly to the rendered image, so letterboxing cannot shift markers. */}
+            <div className="relative inline-block leading-none">
+              <img
+                ref={imgRef}
+                onLoad={handleImageLoad}
+                onClick={handleImageClick}
+                src={primaryViewUrl}
+                alt="Calibration Reference"
+                className="max-h-[380px] w-auto object-contain select-none cursor-crosshair"
+              />
 
-            {pointA && imgDims && (
-              <div
-                className="absolute w-4 h-4 -ml-2 -mt-2 rounded-full border-2 border-emerald-400 bg-emerald-400/40 flex items-center justify-center pointer-events-none text-[9px] font-bold text-black"
-                style={{
-                  left: `${(pointA[0] / imgDims[0]) * 100}%`,
-                  top: `${(pointA[1] / imgDims[1]) * 100}%`
-                }}
-              >
-                A
-              </div>
-            )}
+              {detection && imgDims && (
+                <div
+                  className="absolute border-2 border-emerald-400/80 bg-emerald-400/5 pointer-events-none"
+                  style={{
+                    left: `${(Math.min(...detection.cornersPx.map((p) => p[0])) / imgDims[0]) * 100}%`,
+                    top: `${(Math.min(...detection.cornersPx.map((p) => p[1])) / imgDims[1]) * 100}%`,
+                    width: `${((Math.max(...detection.cornersPx.map((p) => p[0])) - Math.min(...detection.cornersPx.map((p) => p[0]))) / imgDims[0]) * 100}%`,
+                    height: `${((Math.max(...detection.cornersPx.map((p) => p[1])) - Math.min(...detection.cornersPx.map((p) => p[1]))) / imgDims[1]) * 100}%`,
+                  }}
+                />
+              )}
 
-            {pointB && imgDims && (
-              <div
-                className="absolute w-4 h-4 -ml-2 -mt-2 rounded-full border-2 border-cyan-400 bg-cyan-400/40 flex items-center justify-center pointer-events-none text-[9px] font-bold text-black"
-                style={{
-                  left: `${(pointB[0] / imgDims[0]) * 100}%`,
-                  top: `${(pointB[1] / imgDims[1]) * 100}%`
-                }}
-              >
-                B
-              </div>
-            )}
+              {pointA && imgDims && (
+                <div
+                  className="absolute w-4 h-4 -ml-2 -mt-2 rounded-full border-2 border-emerald-400 bg-emerald-400/40 flex items-center justify-center pointer-events-none text-[9px] font-bold text-black"
+                  style={{
+                    left: `${(pointA[0] / imgDims[0]) * 100}%`,
+                    top: `${(pointA[1] / imgDims[1]) * 100}%`
+                  }}
+                >
+                  A
+                </div>
+              )}
+
+              {pointB && imgDims && (
+                <div
+                  className="absolute w-4 h-4 -ml-2 -mt-2 rounded-full border-2 border-cyan-400 bg-cyan-400/40 flex items-center justify-center pointer-events-none text-[9px] font-bold text-black"
+                  style={{
+                    left: `${(pointB[0] / imgDims[0]) * 100}%`,
+                    top: `${(pointB[1] / imgDims[1]) * 100}%`
+                  }}
+                >
+                  B
+                </div>
+              )}
+            </div>
           </div>
 
           {/* Measurements Form */}
@@ -238,7 +359,10 @@ export const ScaleCalibrator: React.FC<ScaleCalibratorProps> = ({
           <div className="text-[11px] font-mono text-slate-400">
             {mmPerPixel ? (
               <span className="text-emerald-400 flex items-center gap-1">
-                <Check className="w-3.5 h-3.5" /> 1:1 mm Scale Calibrated
+                <Check className="w-3.5 h-3.5" />
+                {detection
+                  ? `1:1 mm Scale Locked (${detection.mode === 'id1_card' ? 'ID-1 auto-detect' : `ArUco #${detection.markerId ?? '?'}`})`
+                  : '1:1 mm Scale Calibrated'}
               </span>
             ) : (
               <span>Pick Point A and Point B on image</span>

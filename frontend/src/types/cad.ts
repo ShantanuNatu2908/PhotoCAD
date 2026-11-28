@@ -9,6 +9,33 @@ export interface CalibrationSpec {
   mm_per_unit?: number;
 }
 
+export type AppPage = 'capture' | 'generate' | 'viewer' | 'projects';
+
+export interface ActivePipelineEngines {
+  segmentation: string;
+  depth_fusion: string;
+  llm_vlm: string;
+  cad_kernel: string;
+  cloud_gpu_ready: string;
+  modal_tokens_set?: string;
+  multimodal_llm_ready: string;
+}
+
+export interface SavedScanItem {
+  scan_id: string;
+  project_id: string;
+  project_name: string;
+  status: string;
+  confirmed_sides: AxisView[];
+  views_count: number;
+  ply_url?: string;
+  thumbnail_url?: string;
+  geometry_report?: Open3DGeometryReport | null;
+  calibration?: CalibrationSpec | null;
+  created_at?: string;
+  latest_generation?: CadGeneration | null;
+}
+
 export interface KeyframeCapture {
   side: AxisView;
   blob: Blob;
@@ -17,6 +44,7 @@ export interface KeyframeCapture {
   width: number;
   height: number;
   timestamp: string;
+  source?: 'camera' | 'upload';
 }
 
 export interface DetectedPlane {
@@ -59,6 +87,7 @@ export interface ScanFusionResponse {
   masked_urls: Partial<Record<AxisView, string>>;
   geometry_report: Open3DGeometryReport;
   telemetry: Record<string, unknown>;
+  active_models?: ActivePipelineEngines;
 }
 
 export interface ScanWsEvent {

@@ -1,8 +1,10 @@
 import type {
+  ActivePipelineEngines,
   AgentLog,
   AxisView,
   CalibrationSpec,
   KeyframeCapture,
+  SavedScanItem,
   ScanFusionResponse,
   ScanWsEvent,
   ValidationMetrics,
@@ -80,11 +82,20 @@ export async function confirmKeyframeView(
       blur_score: capture.blurScore,
       width_px: capture.width,
       height_px: capture.height,
+      manual_override: true,
     }),
   });
   if (!res.ok) {
     throw new Error(await parseErrorMessage(res, `Failed to confirm ${side} view`));
   }
+}
+
+export async function fetchSavedScans(): Promise<SavedScanItem[]> {
+  const res = await fetch(`${API_BASE}/scans`);
+  if (!res.ok) {
+    throw new Error(await parseErrorMessage(res, 'Failed to load saved scans'));
+  }
+  return res.json();
 }
 
 export async function submitCalibration(
@@ -101,14 +112,27 @@ export async function submitCalibration(
   }
 }
 
-export async function triggerCvFusion(scanId: string): Promise<ScanFusionResponse> {
+export async function triggerCvFusion(scanId: string, strictCloud = false): Promise<ScanFusionResponse> {
   const res = await fetch(`${API_BASE}/scans/${scanId}/fuse`, {
     method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ strict_cloud: strictCloud }),
   });
   if (!res.ok) {
     throw new Error(await parseErrorMessage(res, 'CV 3D Fusion failed'));
   }
   return res.json();
+}
+
+export async function fetchActiveEngines(): Promise<ActivePipelineEngines | null> {
+  try {
+    const res = await fetch(`${API_BASE}/health/cloud`);
+    if (!res.ok) return null;
+    const data = (await res.json()) as { active_engines?: ActivePipelineEngines };
+    return data.active_engines || null;
+  } catch {
+    return null;
+  }
 }
 
 export function subscribeScanEvents(
@@ -147,28 +171,33 @@ export function subscribeScanEvents(
  */
 export async function uploadAndRunCvFusion(
   projectId: string,
-  captures: Record<AxisView, KeyframeCapture>,
+  captures: Partial<Record<AxisView, KeyframeCapture>>,
   calibration: CalibrationSpec,
-  onWsEvent?: (ev: ScanWsEvent) => void
+  onWsEvent?: (ev: ScanWsEvent) => void,
+  existingScanId?: string | null,
+  strictCloud = false
 ): Promise<ScanFusionResponse> {
-  const session = await createScanSession(projectId);
-  const scanId = session.scan_id;
+  let scanId = existingScanId && !existingScanId.startsWith('demo-') ? existingScanId : null;
+  if (!scanId) {
+    const session = await createScanSession(projectId);
+    scanId = session.scan_id;
+  }
 
   const unsubscribe = onWsEvent ? subscribeScanEvents(scanId, onWsEvent) : () => {};
 
   try {
-    const sides = Object.keys(captures) as AxisView[];
+    const sides = (Object.keys(captures) as AxisView[]).filter((s) => Boolean(captures[s]));
     await Promise.all(
       sides.map(async (side) => {
-        const cap = captures[side];
-        const uploadUrl = session.upload_urls[side];
+        const cap = captures[side]!;
+        const uploadUrl = `${API_BASE}/scans/${scanId}/views/${side}/upload`;
         await uploadKeyframeBinary(uploadUrl, cap.blob);
-        await confirmKeyframeView(scanId, side, cap);
+        await confirmKeyframeView(scanId!, side, cap);
       })
     );
 
     await submitCalibration(scanId, calibration);
-    return await triggerCvFusion(scanId);
+    return await triggerCvFusion(scanId, strictCloud);
   } finally {
     // Allow final WS event flush before teardown
     setTimeout(unsubscribe, 400);
@@ -198,6 +227,7 @@ export interface ScanGenerateApiResponse {
   };
   validation_metrics?: ValidationMetrics | null;
   agent_logs?: AgentLog[];
+  active_models?: ActivePipelineEngines;
 }
 
 export async function uploadSingleViewKeyframe(
@@ -216,9 +246,11 @@ export async function uploadSingleViewKeyframe(
   return scanId;
 }
 
-export async function generateCadForScan(scanId: string): Promise<ScanGenerateApiResponse> {
+export async function generateCadForScan(scanId: string, strictCloud = false): Promise<ScanGenerateApiResponse> {
   const res = await fetch(`${API_BASE}/scans/${scanId}/generate`, {
     method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ strict_cloud: strictCloud }),
   });
   if (!res.ok) {
     throw new Error(await parseErrorMessage(res, 'LangGraph CAD generation failed'));
