@@ -10,12 +10,13 @@ with Anthropic fallback) or deterministic Open3D synthesis in offline mode.
 from __future__ import annotations
 
 import json
-import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
+from app.agents.llm_router import build_llm_candidates, invoke_with_failover
+from app.agents.media_utils import encode_scan_thumbnails_b64
 from app.agents.state import PhotoCADGraphState
 from app.core.config import settings
 from app.schemas.adt import Open3DGeometryReport
@@ -40,8 +41,18 @@ class SpatialAnalysisModel(BaseModel):
     engineering_summary: str
 
 
-def _deterministic_analysis(report: Open3DGeometryReport) -> SpatialAnalysisModel:
-    """Derives exact millimeter inventory directly from Open3DGeometryReport ADT."""
+def _load_visual_hull_meta(scan_id: str) -> Optional[Dict[str, Any]]:
+    hull_path = settings.EXPORTS_DIR / scan_id / "visual_hull.json"
+    if not hull_path.exists():
+        return None
+    try:
+        return json.loads(hull_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _deterministic_analysis(report: Open3DGeometryReport, hull_meta: Optional[Dict[str, Any]] = None) -> SpatialAnalysisModel:
+    """Derives exact millimeter inventory directly from Open3DGeometryReport ADT + carved visual hull."""
     lx, wy, hz = report.bounding_box_mm
     features: List[IdentifiedFeature] = []
 
@@ -64,13 +75,19 @@ def _deterministic_analysis(report: Open3DGeometryReport) -> SpatialAnalysisMode
                 )
             )
 
-    classification = (
-        "Flanged Cylindrical Housing"
-        if features and any(f.kind == "boss" for f in features)
-        else "Machined Mounting Block with Through-Bore"
-        if features
-        else "Prismatic Mechanical Block"
-    )
+    is_sculpted = bool(hull_meta and hull_meta.get("is_sculpted"))
+    fill_pct = int(round(float((hull_meta or {}).get("fill_ratio", 1.0)) * 100))
+
+    if features and any(f.kind == "boss" for f in features):
+        classification = "Flanged Cylindrical Housing"
+    elif features and is_sculpted:
+        classification = f"Contoured Multi-View Part with Bore ({fill_pct}% hull fill)"
+    elif features:
+        classification = "Machined Mounting Block with Through-Bore"
+    elif is_sculpted:
+        classification = f"Sculpted Multi-View 3D Solid ({fill_pct}% hull fill)"
+    else:
+        classification = "Prismatic Mechanical Block"
 
     return SpatialAnalysisModel(
         object_classification=classification,
@@ -86,34 +103,6 @@ def _deterministic_analysis(report: Open3DGeometryReport) -> SpatialAnalysisMode
     )
 
 
-def _get_structured_analyst_llm():
-    gemini_key = settings.GEMINI_API_KEY or os.getenv("GEMINI_API_KEY", "")
-    anthropic_key = os.getenv("ANTHROPIC_API_KEY", "")
-
-    if gemini_key and "your-gemini" not in gemini_key:
-        try:
-            from langchain_google_genai import ChatGoogleGenerativeAI
-
-            model_name = os.getenv("ANALYST_MODEL", settings.DEFAULT_LLM_MODEL or "gemini-2.0-flash")
-            return ChatGoogleGenerativeAI(
-                model=model_name, google_api_key=gemini_key, temperature=0.1
-            ).with_structured_output(SpatialAnalysisModel)
-        except Exception:
-            pass
-
-    if anthropic_key and "your-anthropic" not in anthropic_key:
-        try:
-            from langchain_anthropic import ChatAnthropic
-
-            return ChatAnthropic(
-                model="claude-sonnet-4-5-20250929", api_key=anthropic_key, temperature=0.1
-            ).with_structured_output(SpatialAnalysisModel)
-        except Exception:
-            pass
-
-    return None
-
-
 async def geometry_analyst_node(state: PhotoCADGraphState) -> Dict[str, Any]:
     """Node 1: Synthesizes Open3D report + 6 masked views into strict millimeter spatial analysis."""
     report = state["geometry_report"]
@@ -121,25 +110,46 @@ async def geometry_analyst_node(state: PhotoCADGraphState) -> Dict[str, Any]:
         report = Open3DGeometryReport(**report)
 
     ts = datetime.now(timezone.utc).isoformat()
-    llm = _get_structured_analyst_llm()
-    analysis: SpatialAnalysisModel
+    candidates = build_llm_candidates(
+        override_env="ANALYST_MODEL",
+        temperature=0.1,
+        structured_schema=SpatialAnalysisModel,
+        prefer_anthropic=False,
+    )
+    analysis: Optional[SpatialAnalysisModel] = None
+    used_model: Optional[str] = None
 
-    if llm is not None:
-        prompt = (
-            "You are PhotoCAD Node 1 (Geometry Analyst). Reconcile the millimeter Open3D ground truth "
-            "and 6 captured viewpoints into a structured mechanical engineering specification.\n"
+    hull_meta = _load_visual_hull_meta(state["scan_id"])
+
+    if candidates:
+        thumbs = encode_scan_thumbnails_b64(state["scan_id"])
+        text_prompt = (
+            "You are PhotoCAD Node 1 (Geometry Analyst). Inspect ALL attached orthogonal view images alongside the "
+            "millimeter Open3D ground truth to identify the real object (car, enclosure, bracket, housing, etc.), "
+            "its curved/contoured silhouette characteristics, and true internal bores (do NOT invent holes if absent).\n"
             f"Open3DGeometryReport:\n{json.dumps(report.model_dump(), indent=2)}\n"
-            f"Masked View Keys: {list((state.get('masked_image_urls') or {}).keys())}\n"
-            "Rules: Always work strictly in millimeters (1:1 mm). Trust bounding_box_mm and high-confidence cylinder radii."
+            f"Sculpted Hull Fill Ratio: {(hull_meta or {}).get('fill_ratio', 1.0)}\n"
+            f"Captured Sides: {[t['side'] for t in thumbs] or list((state.get('masked_image_urls') or {}).keys())}\n"
+            "Rules: Always work strictly in millimeters (1:1 mm)."
         )
-        try:
-            analysis = await llm.ainvoke(prompt)
-        except Exception:
-            analysis = _deterministic_analysis(report)
-    else:
-        analysis = _deterministic_analysis(report)
+        if thumbs:
+            from langchain_core.messages import HumanMessage
+
+            content: List[Any] = [{"type": "text", "text": text_prompt}]
+            for t in thumbs:
+                content.append({"type": "text", "text": f"Perspective [{t['side'].upper()}]:"})
+                content.append({"type": "image_url", "image_url": {"url": t["data_url"]}})
+            prompt_payload: Any = [HumanMessage(content=content)]
+        else:
+            prompt_payload = text_prompt
+
+        analysis, used_model, _ = await invoke_with_failover(prompt_payload, candidates)
+
+    if analysis is None:
+        analysis = _deterministic_analysis(report, hull_meta)
 
     analysis_dict = analysis.model_dump()
+    engine_tag = f"[{used_model}] " if used_model else ""
     event = {
         "event": "agent_node_started",
         "scan_id": state["scan_id"],
@@ -148,7 +158,8 @@ async def geometry_analyst_node(state: PhotoCADGraphState) -> Dict[str, Any]:
         "payload": {
             "node": "geometry_analyst",
             "iteration": state.get("geometry_iterations", 0) + 1,
-            "message": f"Identified {analysis.object_classification}: {analysis.length_x_mm}×{analysis.width_y_mm}×{analysis.height_z_mm} mm",
+            "model": used_model or "deterministic",
+            "message": f"{engine_tag}Identified {analysis.object_classification}: {analysis.length_x_mm}×{analysis.width_y_mm}×{analysis.height_z_mm} mm",
             "analysis": analysis_dict,
         },
     }

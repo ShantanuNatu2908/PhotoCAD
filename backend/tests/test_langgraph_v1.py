@@ -18,7 +18,12 @@ from unittest.mock import patch
 from langgraph.checkpoint.memory import MemorySaver
 
 from app.agents.graph import run_photocad_langgraph
-from app.schemas.adt import CSGFeatureTree, DetectedCylinder, FeatureStep, Open3DGeometryReport
+from app.schemas.adt import (
+    CSGFeatureTree,
+    DetectedCylinder,
+    FeatureStep,
+    Open3DGeometryReport,
+)
 
 
 def _make_report(scan_id: str = "scn_lg_01", lx: float = 80.0, wy: float = 50.0, hz: float = 30.0) -> Open3DGeometryReport:

@@ -15,7 +15,6 @@ from PIL import Image
 from app.core.database import init_db
 from app.main import app
 
-
 asyncio.run(init_db())
 client = TestClient(app)
 

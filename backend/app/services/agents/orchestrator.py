@@ -13,8 +13,7 @@ from __future__ import annotations
 import os
 import shutil
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional, cast
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -140,8 +139,8 @@ class AgentOrchestrator:
         if not gen:
             raise ValueError(f"Generation {generation_id} not found")
 
-        scan_id = scan_session_id or gen.scan_session_id
-        gen.status = "generating"
+        scan_id = cast(str, scan_session_id or gen.scan_session_id)
+        gen.status = "generating"  # type: ignore[assignment]
         await self.db.commit()
 
         if geometry_report_json:
@@ -201,32 +200,32 @@ class AgentOrchestrator:
         if best_code:
             gen_py.write_text(best_code, encoding="utf-8")
 
-        gen.code = best_code
-        gen.dimensions_mm = best_dims or {
+        gen.code = best_code  # type: ignore[assignment]
+        gen.dimensions_mm = best_dims or {  # type: ignore[assignment]
             "x": report.bounding_box_mm[0],
             "y": report.bounding_box_mm[1],
             "z": report.bounding_box_mm[2],
         }
-        gen.status = "completed" if final_status in ("completed", "completed_with_warning") else "failed"
-        gen.error_log = final_state.get("compile_error_trace")
+        gen.status = "completed" if final_status in ("completed", "completed_with_warning") else "failed"  # type: ignore[assignment]
+        gen.error_log = final_state.get("compile_error_trace")  # type: ignore[assignment]
 
         if gen_step.exists():
-            gen.step_file = f"/storage/cad_exports/{generation_id}.step"
+            gen.step_file = f"/storage/cad_exports/{generation_id}.step"  # type: ignore[assignment]
         if gen_stl.exists():
-            gen.stl_file = f"/storage/cad_exports/{generation_id}.stl"
+            gen.stl_file = f"/storage/cad_exports/{generation_id}.stl"  # type: ignore[assignment]
         if gen_dxf.exists():
-            gen.dxf_file = f"/storage/cad_exports/{generation_id}.dxf"
+            gen.dxf_file = f"/storage/cad_exports/{generation_id}.dxf"  # type: ignore[assignment]
 
         await self.db.commit()
         await self.db.refresh(gen)
 
-        best_metrics = final_state.get("best_metrics")
+        best_metrics: Any = final_state.get("best_metrics")
         metrics_dict = (
             best_metrics.model_dump()
             if hasattr(best_metrics, "model_dump")
             else (best_metrics if isinstance(best_metrics, dict) else {})
         )
-        setattr(gen, "_latest_validation_metrics", metrics_dict)
+        gen._latest_validation_metrics = metrics_dict
 
         # Broadcast terminal completion envelope
         if self.ws_broadcast:

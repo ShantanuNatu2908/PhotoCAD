@@ -12,14 +12,18 @@ Constructs a top-down CSGFeatureTree ADT with:
 from __future__ import annotations
 
 import json
-import os
 import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from app.agents.llm_router import build_llm_candidates, invoke_with_failover
 from app.agents.state import PhotoCADGraphState
-from app.core.config import settings
-from app.schemas.adt import CSGFeatureTree, FeatureStep, Open3DGeometryReport, ValidationMetrics
+from app.schemas.adt import (
+    CSGFeatureTree,
+    FeatureStep,
+    Open3DGeometryReport,
+    ValidationMetrics,
+)
 
 
 def _extract_clause_target_mm(clause: str, keywords_pattern: str) -> Optional[float]:
@@ -199,59 +203,44 @@ def _build_deterministic_feature_tree(
     )
 
 
-def _get_structured_architect_llm():
-    gemini_key = settings.GEMINI_API_KEY or os.getenv("GEMINI_API_KEY", "")
-    anthropic_key = os.getenv("ANTHROPIC_API_KEY", "")
-
-    if gemini_key and "your-gemini" not in gemini_key:
-        try:
-            from langchain_google_genai import ChatGoogleGenerativeAI
-
-            model_name = os.getenv("ARCHITECT_MODEL", settings.DEFAULT_LLM_MODEL or "gemini-2.0-flash")
-            return ChatGoogleGenerativeAI(
-                model=model_name, google_api_key=gemini_key, temperature=0.1
-            ).with_structured_output(CSGFeatureTree)
-        except Exception:
-            pass
-
-    if anthropic_key and "your-anthropic" not in anthropic_key:
-        try:
-            from langchain_anthropic import ChatAnthropic
-
-            return ChatAnthropic(
-                model="claude-sonnet-4-5-20250929", api_key=anthropic_key, temperature=0.1
-            ).with_structured_output(CSGFeatureTree)
-        except Exception:
-            pass
-
-    return None
-
-
 async def parametric_architect_node(state: PhotoCADGraphState) -> Dict[str, Any]:
     """Node 2: Builds or refines CSGFeatureTree ADT in strict topological order."""
     ts = datetime.now(timezone.utc).isoformat()
-    llm = _get_structured_architect_llm()
+    candidates = build_llm_candidates(
+        override_env="ARCHITECT_MODEL",
+        temperature=0.1,
+        structured_schema=CSGFeatureTree,
+        prefer_anthropic=False,
+    )
     metrics = state.get("validation_metrics")
     edit_instr = state.get("user_edit_instruction")
+    prev_tree = state.get("feature_tree")
+    prev_params = (
+        prev_tree.get("global_parameters_mm")
+        if isinstance(prev_tree, dict)
+        else getattr(prev_tree, "global_parameters_mm", None)
+    )
+    feature_tree: Optional[CSGFeatureTree] = None
+    used_model: Optional[str] = None
 
     # Skip LLM round-trip during deterministic Outer Loop delta adjustment if delta is unambiguous,
-    # otherwise consult structured LLM when API keys are live
-    if llm is not None and not (metrics and getattr(metrics, "discrepancy_notes", None)):
+    # otherwise consult structured LLM with automatic multi-model failover
+    if candidates and not (metrics and getattr(metrics, "discrepancy_notes", None)):
         prompt = (
             "You are PhotoCAD Node 2 (Parametric CAD Architect). Produce a CSGFeatureTree in strictly 1:1 mm.\n"
             f"Spatial Analysis:\n{json.dumps(state.get('spatial_analysis') or {}, indent=2)}\n"
+            f"Previous Global Parameters (mm): {json.dumps(prev_params or {}, indent=2)}\n"
             f"Open3D Report:\n{json.dumps(state['geometry_report'].model_dump() if hasattr(state['geometry_report'], 'model_dump') else state['geometry_report'], indent=2)}\n"
             f"User Edit Instruction: {edit_instr or 'None'}\n"
             "CRITICAL: Always place fillets and chamfers LAST in `steps`, and use uppercase parameter names like LENGTH_MM."
         )
-        try:
-            feature_tree = await llm.ainvoke(prompt)
-        except Exception:
-            feature_tree = _build_deterministic_feature_tree(state)
-    else:
+        feature_tree, used_model, _ = await invoke_with_failover(prompt, candidates)
+
+    if feature_tree is None:
         feature_tree = _build_deterministic_feature_tree(state)
 
     iteration = state.get("geometry_iterations", 0) + 1
+    engine_tag = f"[{used_model}] " if used_model else ""
     event = {
         "event": "agent_node_started",
         "scan_id": state["scan_id"],
@@ -260,7 +249,8 @@ async def parametric_architect_node(state: PhotoCADGraphState) -> Dict[str, Any]
         "payload": {
             "node": "parametric_architect",
             "iteration": iteration,
-            "message": f"Planned {len(feature_tree.steps)}-step CSG tree ({', '.join(s.operation for s in feature_tree.steps)})",
+            "model": used_model or "deterministic",
+            "message": f"{engine_tag}Planned {len(feature_tree.steps)}-step CSG tree ({', '.join(s.operation for s in feature_tree.steps)})",
             "global_parameters_mm": feature_tree.global_parameters_mm,
         },
     }

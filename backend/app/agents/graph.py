@@ -16,13 +16,15 @@ Topology:
 
 from __future__ import annotations
 
-import os
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional, cast
 
-from langgraph.checkpoint.memory import MemorySaver
-from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.graph import END, START, StateGraph
 
+from app.agents.checkpointing import (
+    MemorySaver,
+    build_serde,
+    resolve_checkpointer,
+)
 from app.agents.nodes.analyst import geometry_analyst_node
 from app.agents.nodes.architect import parametric_architect_node
 from app.agents.nodes.executor import sandbox_executor_node
@@ -31,22 +33,11 @@ from app.agents.nodes.validator import geometric_validator_node
 from app.agents.state import PhotoCADGraphState
 from app.schemas.adt import Open3DGeometryReport
 
-
 WsStreamCallback = Optional[Callable[[Dict[str, Any]], Awaitable[None]]]
 
-ALLOWED_ADT_MODULES = [
-    ("app.schemas.adt", "Open3DGeometryReport"),
-    ("app.schemas.adt", "CSGFeatureTree"),
-    ("app.schemas.adt", "ValidationMetrics"),
-    ("app.schemas.adt", "FeatureStep"),
-    ("app.schemas.adt", "DetectedPlane"),
-    ("app.schemas.adt", "DetectedCylinder"),
-]
-
-# Shared in-memory checkpointer with strict Pydantic ADT allowlist
-_MEMORY_CHECKPOINTER = MemorySaver(
-    serde=JsonPlusSerializer(allowed_msgpack_modules=ALLOWED_ADT_MODULES)
-)
+# Shared in-memory checkpointer for synchronous graph construction; the async
+# runner replaces it with the tiered durable resolver (Postgres/Redis/File/Memory).
+_MEMORY_CHECKPOINTER = MemorySaver(serde=build_serde())
 
 
 def _entry_router(state: PhotoCADGraphState) -> str:
@@ -67,7 +58,7 @@ def _inner_compile_router(state: PhotoCADGraphState) -> str:
 
 def _outer_accuracy_router(state: PhotoCADGraphState) -> str:
     """Routes dimensional Chamfer deviations (>1.0mm) back to Node 2 up to max 3 iterations."""
-    metrics = state.get("validation_metrics")
+    metrics: Any = state.get("validation_metrics")
     passed = False
     is_watertight = False
     if metrics is not None:
@@ -137,15 +128,7 @@ def build_photocad_graph(checkpointer: Any = None):
 
 
 def _get_checkpointer():
-    """Attempts RedisSaver if configured with Redis Stack modules; falls back cleanly to MemorySaver."""
-    redis_url = os.getenv("REDIS_URL", "")
-    if redis_url and "your-endpoint" not in redis_url:
-        try:
-            from langgraph.checkpoint.redis import RedisSaver  # type: ignore
-
-            return RedisSaver.from_conn_string(redis_url)
-        except Exception:
-            pass
+    """Synchronous accessor retained for callers that build the graph outside a loop."""
     return _MEMORY_CHECKPOINTER
 
 
@@ -163,7 +146,8 @@ async def run_photocad_langgraph(
     Executes or resumes the cyclic Dual-Loop LangGraph pipeline with streaming node transitions
     and hard `recursion_limit=20` safety cap.
     """
-    compiled = build_photocad_graph(checkpointer=checkpointer)
+    active_checkpointer = checkpointer if checkpointer is not None else await resolve_checkpointer()
+    compiled = build_photocad_graph(checkpointer=active_checkpointer)
     tid = thread_id or f"thread_{scan_id}"
 
     if isinstance(geometry_report, dict):
@@ -218,12 +202,12 @@ async def run_photocad_langgraph(
                         await ws_event_cb(ev)
 
     final_snapshot = compiled.get_state(config)
-    final_state: PhotoCADGraphState = dict(final_snapshot.values)
+    final_state = cast(PhotoCADGraphState, final_snapshot.values)
 
     if not final_state.get("best_code"):
         final_state["final_status"] = "failed"
     elif final_state.get("final_status") not in ("completed", "completed_with_warning"):
-        metrics = final_state.get("best_metrics")
+        metrics: Any = final_state.get("best_metrics")
         passed = bool(
             metrics.passed_tolerance
             if hasattr(metrics, "passed_tolerance")
