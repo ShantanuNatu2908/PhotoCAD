@@ -5,6 +5,7 @@ Document ID: PCAD-LG-004
 
 from app.agents.rag import Build123dRAGService
 
+
 def test_rag_retrieval_matching():
     # Query for fillet and hole operations
     docs = Build123dRAGService.retrieve_context_for_operations(["fillet", "hole"])
